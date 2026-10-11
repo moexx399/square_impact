@@ -63,7 +63,7 @@ jobs:
           Copy-Item adb/NOTICE.txt release/adb-NOTICE.txt
           Compress-Archive release/* square_impact-windows.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: square_impact-windows
           path: square_impact-windows.zip
