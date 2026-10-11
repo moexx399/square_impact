@@ -1,0 +1,3 @@
+kind: Changed
+body: Release builds check the tag matches the code version and include CHANGELOG.md in the zip
+time: 2026-10-11T17:44:21.542796-05:00

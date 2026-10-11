@@ -1,0 +1,19 @@
+# Changelog
+
+All notable changes to square_impact are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Entries are managed with [changie](https://changie.dev): add one with
+`changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+## v0.1.0 - 2026-10-11
+### Added
+* Capture the high-speed frames around each shot from the Square Omni launch cameras over USB, read-only (adb + /dev/mem)
+* `obs` command: OBS browser-source overlay that pops up each shot, plays it twice in slow motion, then disappears
+* `live` desktop viewer that re-arms after every shot and opens each clip on the contact frame
+* Automatic contact detection using sub-pixel ball tracking; detections with no ball in view are ignored
+* Show the Omni's own ball speed, launch angle, direction and spin with each shot
+* `shot`, `view`, `status`, `sample`, `grab`, `impact` and `version` commands
+* Keep only the newest 5 captures in `shots/`
+* Single-file Windows exe with adb bundled, built and released by GitHub Actions

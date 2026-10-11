@@ -1,0 +1,41 @@
+﻿# Changelog management: https://changie.dev
+# Every user-visible change adds a fragment:  changie new
+# Releasing:  changie batch auto && changie merge   (see CONTRIBUTING.md)
+changesDir: .changes
+unreleasedDir: unreleased
+headerPath: header.tpl.md
+changelogPath: CHANGELOG.md
+versionExt: md
+versionFormat: '## {{.Version}} - {{.Time.Format "2006-01-02"}}'
+kindFormat: '### {{.Kind}}'
+changeFormat: '* {{.Body}}'
+body:
+  minLength: 3
+  maxLength: 300
+kinds:
+  # While the project is 0.x, breaking changes bump the minor version.
+  - label: Added
+    auto: minor
+  - label: Changed
+    auto: minor
+  - label: Deprecated
+    auto: minor
+  - label: Removed
+    auto: minor
+  - label: Fixed
+    auto: patch
+  - label: Security
+    auto: patch
+newlines:
+  afterChangelogHeader: 0
+  beforeChangelogVersion: 1
+  endOfVersion: 1
+envPrefix: CHANGIE_
+# `changie batch` stamps the new version into these files.
+replacements:
+  - path: square_impact.py
+    find: '^VERSION = ".*"'
+    replace: 'VERSION = "{{.VersionNoPrefix}}"'
+  - path: pyproject.toml
+    find: '^version = ".*"'
+    replace: 'version = "{{.VersionNoPrefix}}"'

@@ -1,0 +1,6 @@
+# Normalise line endings in the repo; keep LF on checkout for source files
+* text=auto eol=lf
+*.png binary
+*.pgm binary
+*.exe binary
+*.dll binary

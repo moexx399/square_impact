@@ -497,7 +497,7 @@ def capture(idxs, cams, wait_shot, tag):
     print(f"{lay['board']} ({lay['mode']}): {w}x{h} @ {lay['fps']:.0f} fps, "
           f"{len(idxs)} of {lay['nbuf']} buffers, cam {'+'.join(map(str, cams))}")
     if wait_shot:
-        print(f"waiting for a shot (Ctrl+C to cancel)...")
+        print("waiting for a shot (Ctrl+C to cancel)...")
     columns = read_frames(lay, idxs, cams, wait_shot)
 
     out_dir = os.path.join(SHOTS_DIR, time.strftime("%Y%m%d_%H%M%S") + f"_{lay['board']}_{tag}")
@@ -1034,7 +1034,7 @@ def serve_overlay(ov, port):
                 try:
                     while True:
                         with ov.cond:
-                            ov.cond.wait_for(lambda: ov.seq != seen, timeout=15)
+                            ov.cond.wait_for(lambda s=seen: ov.seq != s, timeout=15)
                             fresh = ov.seq != seen
                             seen = ov.seq
                             header = ov.shots[seen][0] if fresh else None

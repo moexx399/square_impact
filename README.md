@@ -1,5 +1,12 @@
 # square_impact
 
+[![ci](https://github.com/moexx399/square_impact/actions/workflows/ci.yml/badge.svg)](https://github.com/moexx399/square_impact/actions/workflows/ci.yml)
+[![build-exe](https://github.com/moexx399/square_impact/actions/workflows/build-exe.yml/badge.svg)](https://github.com/moexx399/square_impact/actions/workflows/build-exe.yml)
+[![release](https://img.shields.io/github/v/release/moexx399/square_impact?include_prereleases)](https://github.com/moexx399/square_impact/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![platform: windows](https://img.shields.io/badge/platform-windows-lightgrey)
+
 **Instant high-speed replays from the Square Omni launch monitor's own cameras.**
 
 The Square Omni films every shot at ~500 fps with two internal cameras, but it
@@ -15,6 +22,11 @@ viewer or as a pop-up overlay in OBS.
 > hardware in ways Square doesn't support, and a firmware update could change
 > any of the internals it relies on. See [Disclaimer](#disclaimer) and
 > [License](#license).
+
+**Contents:** [Quick start](#quick-start) · [OBS overlay](#obs-overlay-options) ·
+[Commands](#commands) · [Output](#output) · [How it works](#how-it-works) ·
+[Building the exe](#building-the-exe) · [Known limits](#known-limits) ·
+[Contributing](#contributing) · [Changelog](CHANGELOG.md)
 
 ---
 
@@ -203,6 +215,23 @@ ships in the release zip as `adb-NOTICE.txt`.
   camera's view.
 - Depends on sqocam's log messages and memory layout. A firmware update may
   break it. `status`, `sample` and `grab` are the tools for re-checking.
+
+Found something else? [Open an issue](https://github.com/moexx399/square_impact/issues/new/choose).
+
+## Contributing
+
+Contributions are welcome, including fixes, features, docs, and especially
+**shot captures from setups and swings we haven't tested** (full swings, the
+spin board, different lighting).
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): dev setup, the read-only rule, tests,
+  changelog entries with [changie](https://changie.dev), and releasing.
+- [docs/DEVICE_NOTES.md](docs/DEVICE_NOTES.md): everything known about the
+  Omni's internals (boards, memory layout, log lines, timings, adb quirks).
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release.
+- [Code of Conduct](CODE_OF_CONDUCT.md) · [Security policy](SECURITY.md)
+
+Offline tests need no device: `python -m unittest discover -s tests -v`.
 
 ## Disclaimer
 

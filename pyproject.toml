@@ -1,0 +1,39 @@
+[project]
+name = "square_impact"
+version = "0.1.0"
+description = "Instant high-speed replays from the Square Omni launch monitor's own cameras"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Brandon Moe" }]
+requires-python = ">=3.10"
+dependencies = []   # standard library only; keep it that way (see CONTRIBUTING.md)
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+
+[project.urls]
+Homepage = "https://github.com/moexx399/square_impact"
+Issues = "https://github.com/moexx399/square_impact/issues"
+Changelog = "https://github.com/moexx399/square_impact/blob/main/CHANGELOG.md"
+
+[project.scripts]
+square_impact = "square_impact:main"
+
+# Development tools only: `pip install ruff` (not needed to run square_impact)
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM"]
+ignore = [
+    "E731",   # small lambdas are used deliberately (PNG chunk helper)
+    "SIM105", # explicit try/except/pass reads clearer around device I/O
+    "B905",   # zip() truncation to the shorter input is intended throughout
+]
