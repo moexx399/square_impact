@@ -119,6 +119,11 @@ def bundled_adb():
 
 def version_info():
     print(f"square_impact {VERSION}")
+    release = latest_release(use_cache=False)  # always a fresh check here
+    if release is None:
+        print("    couldn't check for updates (offline, or no releases published yet)")
+    else:
+        print("    " + (update_notice(release) or f"up to date (latest release {release['tag']})"))
     adb = find_adb()
     out = subprocess.run([adb, "version"], capture_output=True, text=True)
     print(f"adb: {adb}")
@@ -1090,26 +1095,26 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
 }
 
 
+def paint(code, s):
+    """ANSI colour on a real terminal, plain text when redirected."""
+    return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else s
+
+
 def banner(cmd):
-    """Startup header. Colour only on a real terminal (not when redirected)."""
+    """Startup header."""
     if os.name == "nt":
         os.system("")  # turns on ANSI escape handling in the classic Windows console
     try:
         sys.stdout.reconfigure(errors="replace")  # never crash on a non-UTF-8 console
     except (AttributeError, ValueError):
         pass
-    tty = sys.stdout.isatty()
-
-    def paint(code, s):
-        return f"\033[{code}m{s}\033[0m" if tty else s
-
     title = f"◉  square_impact  v{VERSION}"
     tagline = "   instant high-speed replays from the Square Omni"
     width = max(len(title), len(tagline)) + 4
@@ -1122,8 +1127,83 @@ def banner(cmd):
     print(flush=True)
 
 
+# ---------------------------------------------------------------- update check
+
+REPO = "moexx399/square_impact"
+LATEST_RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
+UPDATE_CHECK_EVERY = 24 * 3600  # seconds between checks (GitHub allows 60 requests/hour)
+UPDATE_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "square_impact",
+                            "update_check.json")
+
+
+def parse_version(s):
+    """'v1.2.3' / '1.2.3' / '1.2.3-rc1' -> (1, 2, 3); None if it isn't a version."""
+    m = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def latest_release(use_cache=True, timeout=3):
+    """{'tag', 'url'} of the newest published GitHub release, or None if it can't
+    be found out (offline, rate-limited, no releases yet). Cached for a day."""
+    if use_cache:
+        try:
+            with open(UPDATE_CACHE) as fh:
+                cached = json.load(fh)
+            if time.time() - cached["checked"] < UPDATE_CHECK_EVERY:
+                return cached if cached.get("tag") else None
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    import urllib.request
+    req = urllib.request.Request(LATEST_RELEASE_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"square_impact/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        result = {"checked": time.time(), "tag": data.get("tag_name", ""),
+                  "url": data.get("html_url") or RELEASES_PAGE}
+    except OSError as e:  # URLError/HTTPError/timeouts are all OSErrors
+        if getattr(e, "code", None) != 404:
+            return None   # offline etc.: try again next run
+        result = {"checked": time.time(), "tag": "", "url": RELEASES_PAGE}  # no releases yet
+    except ValueError:
+        return None
+    try:
+        os.makedirs(os.path.dirname(UPDATE_CACHE), exist_ok=True)
+        with open(UPDATE_CACHE, "w") as fh:
+            json.dump(result, fh)
+    except OSError:
+        pass
+    return result if result["tag"] else None
+
+
+def update_notice(release):
+    """One-line notice if `release` is newer than this version, else None."""
+    if not release:
+        return None
+    new, ours = parse_version(release["tag"]), parse_version(VERSION)
+    if new and ours and new > ours:
+        return f"Update available: {VERSION} -> {release['tag'].lstrip('v')}   {release['url']}"
+    return None
+
+
+def update_check_enabled(opt_out):
+    """On for the packaged exe (source users update with git), unless opted out."""
+    return FROZEN and not opt_out and not os.environ.get("SQUARE_IMPACT_NO_UPDATE_CHECK")
+
+
+def start_update_check():
+    """Check in the background so startup is never delayed; print if newer."""
+    def run():
+        notice = update_notice(latest_release())
+        if notice:
+            print(paint("1;93", f"  ⬆ {notice}"), flush=True)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
 def main():
-    global ADB
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
                                     "impact", "version"])
@@ -1136,10 +1216,23 @@ def main():
     ap.add_argument("--pad", type=int, default=30, help="frames kept before/after impact (30)")
     ap.add_argument("--port", type=int, default=8765, help="obs: overlay web server port (8765)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="don't check GitHub for a newer release (exe only; also "
+                         "SQUARE_IMPACT_NO_UPDATE_CHECK=1)")
     a = ap.parse_args()
     if a.cmd == "version":
         return version_info()
     banner(a.cmd)
+    upd = start_update_check() if update_check_enabled(a.no_update_check) else None
+    try:
+        return run(a)
+    finally:
+        if upd:
+            upd.join(timeout=2)  # let a short command (status, view) still show the notice
+
+
+def run(a):
+    global ADB
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":

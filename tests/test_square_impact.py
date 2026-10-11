@@ -194,5 +194,84 @@ class Files(unittest.TestCase):
         self.assertEqual(zlib.decompress(idat), b"\x00\x00\x01\x02\x00\x03\x04\x05")
 
 
+class UpdateCheck(unittest.TestCase):
+    """The network is always mocked here; tests never contact GitHub."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._cache, self._version = si.UPDATE_CACHE, si.VERSION
+        si.UPDATE_CACHE = os.path.join(self.tmp, "update_check.json")
+        si.VERSION = "0.2.0"
+
+    def tearDown(self):
+        si.UPDATE_CACHE, si.VERSION = self._cache, self._version
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fake_github(self, tag=None, error=None):
+        """Patch urlopen to return a release with `tag`, or raise `error`."""
+        import io
+        import urllib.request
+        from unittest import mock
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            if error:
+                raise error
+            body = json.dumps({"tag_name": tag, "html_url": f"https://example/{tag}"}).encode()
+            return io.BytesIO(body)
+
+        patcher = mock.patch.object(urllib.request, "urlopen", urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_parse_version(self):
+        self.assertEqual(si.parse_version("v1.2.3"), (1, 2, 3))
+        self.assertEqual(si.parse_version("0.10.0"), (0, 10, 0))
+        self.assertEqual(si.parse_version("1.2.3-rc1"), (1, 2, 3))
+        self.assertIsNone(si.parse_version("nightly"))
+        self.assertIsNone(si.parse_version(None))
+
+    def test_notice_only_when_newer(self):
+        self.assertIn("0.2.0 -> 0.10.0", si.update_notice({"tag": "v0.10.0", "url": "u"}))
+        self.assertIsNone(si.update_notice({"tag": "v0.2.0", "url": "u"}))
+        self.assertIsNone(si.update_notice({"tag": "v0.0.2", "url": "u"}))   # older
+        self.assertIsNone(si.update_notice({"tag": "latest", "url": "u"}))   # not a version
+        self.assertIsNone(si.update_notice(None))
+
+    def test_result_is_cached_for_a_day(self):
+        calls = self.fake_github(tag="v0.3.0")
+        self.assertEqual(si.latest_release()["tag"], "v0.3.0")
+        self.assertEqual(si.latest_release()["tag"], "v0.3.0")
+        self.assertEqual(len(calls), 1)                        # second call used the cache
+        si.latest_release(use_cache=False)
+        self.assertEqual(len(calls), 2)                        # forced refresh
+
+    def test_offline_is_silent_and_not_cached(self):
+        import urllib.error
+        self.fake_github(error=urllib.error.URLError("no network"))
+        self.assertIsNone(si.latest_release())
+        self.assertFalse(os.path.exists(si.UPDATE_CACHE))
+
+    def test_no_releases_yet(self):
+        import urllib.error
+        calls = self.fake_github(error=urllib.error.HTTPError(si.LATEST_RELEASE_API, 404, "x", {}, None))
+        self.assertIsNone(si.latest_release())
+        self.assertIsNone(si.latest_release())
+        self.assertEqual(len(calls), 1)                        # "no releases" is cached too
+
+    def test_only_the_exe_checks_by_default(self):
+        from unittest import mock
+        with mock.patch.object(si, "FROZEN", False):
+            self.assertFalse(si.update_check_enabled(opt_out=False))
+        with mock.patch.object(si, "FROZEN", True), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SQUARE_IMPACT_NO_UPDATE_CHECK", None)
+            self.assertTrue(si.update_check_enabled(opt_out=False))
+            self.assertFalse(si.update_check_enabled(opt_out=True))
+            os.environ["SQUARE_IMPACT_NO_UPDATE_CHECK"] = "1"
+            self.assertFalse(si.update_check_enabled(opt_out=False))
+
+
 if __name__ == "__main__":
     unittest.main()

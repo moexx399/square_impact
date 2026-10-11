@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.3.0 - 2026-10-11
+### Added
+* The exe checks GitHub for a newer release at startup (in the background, at most daily) and prints a link; turn off with --no-update-check or SQUARE_IMPACT_NO_UPDATE_CHECK=1
+* `version` command reports whether a newer release is available
+### Changed
+* Release tags work with or without a leading v (v1.2.3 or 1.2.3)
+
 ## v0.2.0 - 2026-10-11
 ### Added
 * Contributor docs: CONTRIBUTING guide, Code of Conduct, security policy, and issue and pull request templates

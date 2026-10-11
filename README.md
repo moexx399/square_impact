@@ -96,14 +96,32 @@ python square_impact.py status                     board, frame layout, recent d
 python square_impact.py grab  [--shot]             every buffer in the ring (slow; for digging)
 python square_impact.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
 python square_impact.py impact [DIR]               find impact in a full-ring capture
+python square_impact.py version                    version, update check, and the adb in use
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
   --pad N                 frames kept before and after contact (default 30)
+  --no-update-check       skip the check for a newer release (exe only)
 ```
 
 Viewer keys: `←`/`→` step a frame, `Space` play/pause. Buttons jump to impact
 and save the current frame as PNG.
+
+### Update check
+
+When it starts, **the exe** checks GitHub for a newer release in the background
+and, if there is one, prints a line under the banner:
+
+```text
+  ⬆ Update available: 0.1.0 -> 0.2.0   https://github.com/moexx399/square_impact/releases/tag/v0.2.0
+```
+
+It never delays startup or downloads anything; updating is up to you. It asks
+GitHub at most once a day (cached in `%LOCALAPPDATA%\square_impact\update_check.json`)
+and stays silent if you're offline. The request goes to `api.github.com` and
+contains only the app name and version. To turn it off, use `--no-update-check`
+or set `SQUARE_IMPACT_NO_UPDATE_CHECK=1`. Running from source doesn't check
+(use `git pull`), but `version` always does a fresh check.
 
 ## Output
 
