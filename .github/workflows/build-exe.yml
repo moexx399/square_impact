@@ -1,12 +1,13 @@
 # Builds square_impact.exe: a single Windows executable with adb bundled.
 #   - every push / pull request: build + smoke test, exe uploaded as a workflow artifact
-#   - tags v*: also published as a GitHub Release, with notes from changie (.changes/<tag>.md)
+#   - version tags (v1.2.3 or 1.2.3): also published as a GitHub Release, with notes
+#     from changie (.changes/v1.2.3.md)
 name: build-exe
 
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
   pull_request:
   workflow_dispatch:
 
@@ -19,18 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
       - name: Check tag matches the version in the code
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''   # the leading v is optional: v1.2.3 == 1.2.3
           $code = (Select-String -Path square_impact.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
-          if ("v$code" -ne $tag) { Write-Error "tag $tag does not match VERSION $code (run 'changie batch' first)"; exit 1 }
-          if (-not (Test-Path ".changes/$tag.md")) { Write-Error "missing .changes/$tag.md (run 'changie batch')"; exit 1 }
+          if ($version -ne $code) { Write-Error "tag $tag does not match VERSION $code (run 'changie batch' first)"; exit 1 }
+          # changie always names version notes with a v prefix
+          if (-not (Test-Path ".changes/v$version.md")) { Write-Error "missing .changes/v$version.md (run 'changie batch')"; exit 1 }
+          "VERSION=$version" >> $env:GITHUB_ENV
 
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
@@ -63,14 +67,14 @@ jobs:
           Copy-Item adb/NOTICE.txt release/adb-NOTICE.txt
           Compress-Archive release/* square_impact-windows.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: square_impact-windows
           path: square_impact-windows.zip
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
         with:
-          body_path: .changes/${{ github.ref_name }}.md
+          body_path: .changes/v${{ env.VERSION }}.md
           files: square_impact-windows.zip
