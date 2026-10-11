@@ -3,3 +3,13 @@ shots/
 
 # Python bytecode cache
 __pycache__/
+
+# exe build outputs (see .github/workflows/build-exe.yml)
+build/
+dist/
+*.spec
+adb/
+platform-tools/
+platform-tools.zip
+release/
+square_impact-windows.zip

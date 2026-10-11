@@ -8,28 +8,39 @@ straight out of the camera board's memory over USB, a few seconds after each
 shot, and shows them as a slow-motion clip. You can watch it in a desktop
 viewer or as a pop-up overlay in OBS.
 
-> Unofficial. Not affiliated with or endorsed by Square. It reads the device
-> through its debug interface and **never writes anything to it** (see
-> [Read-only by design](#read-only-by-design)). A firmware update could change
-> any of the internals it relies on.
+> **Use at your own risk. This software comes with no warranty of any kind.**
+> It's unofficial and not affiliated with or endorsed by Square. It reads the
+> device through its debug interface and **never writes anything to it** (see
+> [Read-only by design](#read-only-by-design)), but it still talks to the
+> hardware in ways Square doesn't support, and a firmware update could change
+> any of the internals it relies on. See [Disclaimer](#disclaimer) and
+> [License](#license).
 
 ---
 
 ## Quick start
 
-Requirements: Windows, Python 3 (standard library only, nothing to `pip install`),
+**Easiest:** download `square_impact-windows.zip` from the GitHub Releases page
+(or from the latest `build-exe` workflow run). It contains a single
+`square_impact.exe` with `adb` built in, so no Python or Android tools are
+needed. Use it exactly like the commands below, replacing
+`python square_impact.py` with `square_impact.exe`. Shots are saved in a `shots`
+folder next to the exe. The bundled adb is unpacked once to
+`%LOCALAPPDATA%\square_impact\adb\`.
+
+**From source:** Windows, Python 3 (standard library only, nothing to `pip install`),
 and `adb` (`winget install Google.PlatformTools`).
 
 1. Connect the Omni's **launch-camera USB port** (board `r1`) to the PC. It
    shows up as `Tina ADB` in Device Manager. Check with:
    ```bash
-   python omni_frames.py status
+   python square_impact.py status
    ```
 2. Pick how you want to watch:
 
    **OBS overlay.** Each shot pops up, plays twice, then disappears:
    ```bash
-   python omni_frames.py obs
+   python square_impact.py obs
    ```
    In OBS add a **Browser Source** with URL `http://localhost:8765/` and size
    **1280×192** (or any 20:3 size). Open `http://localhost:8765/replay` in any
@@ -37,7 +48,7 @@ and `adb` (`winget install Google.PlatformTools`).
 
    **Desktop viewer.** Stays open and loads every new shot:
    ```bash
-   python omni_frames.py live
+   python square_impact.py live
    ```
 
 3. Hit a ball. The clip shows up about 3–4 seconds later.
@@ -64,15 +75,15 @@ If a new shot arrives mid-playback, it replaces the current one.
 ## Commands
 
 ```text
-python omni_frames.py obs   [--port 8765]        OBS overlay server (headless)
-python omni_frames.py live                       desktop viewer, re-arms after every shot
-python omni_frames.py shot                       capture the next shot once, then view it
-python omni_frames.py view  [DIR]                view a saved clip (default: newest)
-python omni_frames.py status                     board, frame layout, recent detections
+python square_impact.py obs   [--port 8765]        OBS overlay server (headless)
+python square_impact.py live                       desktop viewer, re-arms after every shot
+python square_impact.py shot                       capture the next shot once, then view it
+python square_impact.py view  [DIR]                view a saved clip (default: newest)
+python square_impact.py status                     board, frame layout, recent detections
 
-python omni_frames.py grab  [--shot]             every buffer in the ring (slow; for digging)
-python omni_frames.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
-python omni_frames.py impact [DIR]               find impact in a full-ring capture
+python square_impact.py grab  [--shot]             every buffer in the ring (slow; for digging)
+python square_impact.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
+python square_impact.py impact [DIR]               find impact in a full-ring capture
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
@@ -157,6 +168,31 @@ which disappears when that session closes.
 | Transfer rate | ~2.3 MB/s | ~10 MB/s |
 | Finding contact | 0.3–0.9 s | 0.07 s |
 
+## Building the exe
+
+`.github/workflows/build-exe.yml` runs on every push and pull request
+(`windows-latest`, Python 3.13). It:
+
+1. downloads Google's latest Android SDK platform-tools and takes `adb.exe`,
+   `AdbWinApi.dll`, `AdbWinUsbApi.dll` and `NOTICE.txt`;
+2. builds a one-file `square_impact.exe` with PyInstaller, bundling those files;
+3. smoke-tests it with `square_impact.exe version`, which runs the bundled adb
+   and needs no device;
+4. uploads `square_impact-windows.zip` (exe, README, LICENSE, adb license notice) as a
+   workflow artifact, and attaches it to a GitHub Release when the push is a
+   `v*` tag (`git tag v0.1.0 && git push --tags`).
+
+To build locally, do the same by hand:
+
+```bash
+pip install pyinstaller
+mkdir adb   # then copy adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll, NOTICE.txt from platform-tools into it
+pyinstaller --onefile --console --name square_impact --add-data "adb;adb" square_impact.py
+```
+
+adb is part of the Android SDK platform-tools (Apache 2.0). Its license notice
+ships in the release zip as `adb-NOTICE.txt`.
+
 ## Known limits
 
 - Developed and tested on the **launch board (`r1`) with soft putts and chips
@@ -167,3 +203,26 @@ which disappears when that session closes.
   camera's view.
 - Depends on sqocam's log messages and memory layout. A firmware update may
   break it. `status`, `sample` and `grab` are the tools for re-checking.
+
+## Disclaimer
+
+This software is provided **"as is", without warranty of any kind**, express or
+implied. **You use it entirely at your own risk.** The authors are not
+responsible for any damage to your Square Omni or other equipment, loss of
+data, voided warranties, missed or incorrect shot data, or any other problem
+that comes from using it.
+
+square_impact is an independent project. It is not made, supported, or endorsed
+by Square or its manufacturer, and "Square" and "Omni" are used only to say which
+device it works with. It accesses the device through a debug interface that
+isn't intended for end users. Using it may go against the device's terms of use
+or affect its warranty, so check before you use it.
+
+## License
+
+Released under the [MIT License](LICENSE). You're free to use, copy, modify, and
+share it, including commercially, as long as the copyright and license notice
+are kept. The license includes the full no-warranty terms.
+
+The bundled `adb` in the exe is part of the Android SDK platform-tools, licensed
+separately under the Apache License 2.0. Its notice ships as `adb-NOTICE.txt`.

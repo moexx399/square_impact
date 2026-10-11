@@ -33,17 +33,18 @@ STRICTLY READ-ONLY: device commands only read (/dev/mem, /tmp/sqocam.cfg,
 logread). Nothing is written, pushed, or staged on the device.
 
 Usage:
-    python omni_frames.py obs [--port 8765]     # OBS browser-source overlay: each shot pops up,
-                                                # plays twice, disappears (http://localhost:8765/)
-    python omni_frames.py live [--cam top|bottom|both] [--pad N]
-                                                # viewer that captures every shot, re-arming itself
-    python omni_frames.py shot                  # capture the next shot once, then view it
-    python omni_frames.py status                # board, layout, recent shots
-    python omni_frames.py sample [N] [--shot] [--range A:B]
-                                                # every Nth buffer (default 10) + contact sheet
-    python omni_frames.py grab [--shot]         # every buffer; with --shot, then finds impact
-    python omni_frames.py impact [DIR] [--pad N]  # find impact in a full-ring capture
-    python omni_frames.py view [DIR]            # view a capture (default: newest)
+    python square_impact.py obs [--port 8765]     # OBS browser-source overlay: each shot pops up,
+                                                  # plays twice, disappears (http://localhost:8765/)
+    python square_impact.py live [--cam top|bottom|both] [--pad N]
+                                                  # viewer that captures every shot, re-arming itself
+    python square_impact.py shot                  # capture the next shot once, then view it
+    python square_impact.py status                # board, layout, recent shots
+    python square_impact.py sample [N] [--shot] [--range A:B]
+                                                  # every Nth buffer (default 10) + contact sheet
+    python square_impact.py grab [--shot]         # every buffer; with --shot, then finds impact
+    python square_impact.py impact [DIR] [--pad N]  # find impact in a full-ring capture
+    python square_impact.py view [DIR]            # view a capture (default: newest)
+    python square_impact.py version               # version and the adb in use
 
 Only the newest KEEP_CAPTURES (5) capture folders in shots/ are kept.
 """
@@ -75,7 +76,10 @@ BOARD_MODE = {"r1": "LM", "r2": "SP"}
 SNAPSHOT_MIN = 40   # above this many frames per camera, snapshot the span in one dd
 SESSIONS = 4        # parallel adb sessions per camera for shot captures
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Packaged as a one-file exe (PyInstaller), __file__ is a temp folder deleted
+# on exit, so user data lives next to the exe instead.
+FROZEN = getattr(sys, "frozen", False)
+HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 SHOTS_DIR = os.path.join(HERE, "shots")
 KEEP_CAPTURES = 5   # older capture folders in shots/ are deleted after each save
 
@@ -83,6 +87,8 @@ KEEP_CAPTURES = 5   # older capture folders in shots/ are deleted after each sav
 # ---------------------------------------------------------------- adb helpers
 
 def find_adb():
+    if FROZEN:
+        return bundled_adb()
     adb = shutil.which("adb")
     if adb:
         return adb
@@ -92,6 +98,33 @@ def find_adb():
     if hits:
         return hits[0]
     sys.exit("adb not found on PATH")
+
+
+def bundled_adb():
+    """The exe ships adb.exe + its DLLs. adb starts a server that keeps running
+    after we exit, so it must not run from PyInstaller's temp folder (deleted on
+    exit): copy it once to %LOCALAPPDATA%\\square_impact\\adb and run it there."""
+    src = os.path.join(sys._MEIPASS, "adb")
+    dst = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "square_impact", "adb")
+    os.makedirs(dst, exist_ok=True)
+    for name in os.listdir(src):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if not os.path.exists(d) or os.path.getsize(d) != os.path.getsize(s):
+            try:
+                shutil.copy2(s, d)
+            except PermissionError:
+                pass  # in use by a running adb server; the existing copy works
+    return os.path.join(dst, "adb.exe")
+
+
+def version_info():
+    print(f"square_impact {VERSION}")
+    adb = find_adb()
+    out = subprocess.run([adb, "version"], capture_output=True, text=True)
+    print(f"adb: {adb}")
+    print("    " + "\n    ".join(out.stdout.strip().splitlines()[:2]))
+    if out.returncode:
+        sys.exit("adb failed to run")
 
 
 ADB = None
@@ -1093,7 +1126,7 @@ def main():
     global ADB
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
-                                    "impact"])
+                                    "impact", "version"])
     ap.add_argument("arg", nargs="?", help="sample: step N; view/impact: capture dir")
     ap.add_argument("--shot", action="store_true", help="sample/grab: wait for the next shot")
     ap.add_argument("--range", metavar="A:B", help="sample: only buffers A..B-1 (e.g. 120:150)")
@@ -1104,6 +1137,8 @@ def main():
     ap.add_argument("--port", type=int, default=8765, help="obs: overlay web server port (8765)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
     a = ap.parse_args()
+    if a.cmd == "version":
+        return version_info()
     banner(a.cmd)
     if a.cmd == "view":
         return view(a.arg)
