@@ -1,3 +1,0 @@
-kind: Added
-body: 'Impact snapshot: each shot saves impact.png (launch camera''s contact frame over the spin camera''s first lit frame); the overlay freezes on the impact frame (hold, default 700 ms) and serves the latest snapshot at /impact.png'
-time: 2026-10-11T21:40:23.9751358-05:00

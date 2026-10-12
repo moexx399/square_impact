@@ -1,3 +1,0 @@
-kind: Added
-body: '`status` lists every connected board; `grab`/`sample` take `--board r1|r2`'
-time: 2026-10-11T21:32:08.3638676-05:00

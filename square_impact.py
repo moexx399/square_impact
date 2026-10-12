@@ -1797,7 +1797,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

@@ -1,3 +1,0 @@
-kind: Changed
-body: Shots are saved as `shots/<time>_shot_<boards>/` with one segment per board; older shot folders still open
-time: 2026-10-11T21:32:07.2225087-05:00

@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.7.0 - 2026-10-12
+### Added
+* Spin camera support: with the spin board (r2) USB port connected, each shot shows a sharp, strobe-lit close-up of the ball leaving the club
+* Both boards at once: what is captured and shown follows which USB ports are connected (launch, spin, or both), re-checked every few seconds; with both, a shot plays the launch swing then the spin close-up
+* Launch-camera frames are denoised for display (frame averaging that keeps the club and ball sharp); `--no-denoise` turns it off
+* OBS overlay `fps2` option sets the spin close-up playback speed (default 10)
+* `status` lists every connected board; `grab`/`sample` take `--board r1|r2`
+* Impact snapshot: each shot saves impact.png (launch camera's contact frame over the spin camera's first lit frame); the overlay freezes on the impact frame (hold, default 700 ms) and serves the latest snapshot at /impact.png
+### Changed
+* The overlay and viewers show a 640x192 window that follows the ball on both cameras (`--crop ball`, the new default), keeping it centred
+* Shots are saved as `shots/<time>_shot_<boards>/` with one segment per board; older shot folders still open
+* The Omni does much less: one log follower per board instead of one per capture session; all parsing happens on the PC, and the Omni only does plain memory reads when a shot is logged
+### Fixed
+* Closed or crashed sessions no longer leave adb clients and log followers running on the PC and the Omni
+
 ## v0.6.0 - 2026-10-11
 ### Changed
 * The OBS overlay and viewers also skip the last 20% of each clip (ball rolling away), so clips are contact +/-18 frames; `--trim-back` adjusts it and saved clips keep every frame

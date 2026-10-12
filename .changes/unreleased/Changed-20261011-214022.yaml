@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The Omni does much less: one log follower per board instead of one per capture session; all parsing happens on the PC, and the Omni only does plain memory reads when a shot is logged'
-time: 2026-10-11T21:40:22.7881465-05:00

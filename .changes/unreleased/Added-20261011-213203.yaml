@@ -1,3 +1,0 @@
-kind: Added
-body: Launch-camera frames are denoised for display (frame averaging that keeps the club and ball sharp); `--no-denoise` turns it off
-time: 2026-10-11T21:32:03.759409-05:00
