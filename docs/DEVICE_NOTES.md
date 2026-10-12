@@ -72,6 +72,19 @@ lines for a typical shot, with times relative to the cameras stopping:
   catching shots. square_impact follows the file by name instead
   (`FOLLOW_LOG`: restart `tail` when the inode changes, reading the new file
   from its start).
+- **One follower per board, parsed on the host.** That follower is the only
+  standing process square_impact runs on a board (3 processes: the shell,
+  `tail`, the 2-second rotation check). It sends the last 300 lines first, as
+  context for r2's frame counter, then every new line; the PC picks out the
+  shot lines. Once nothing reads its output, `tail` dies on its next write (the
+  log is written every second) and the follower exits (`kill -0 $tp` fails).
+  An earlier design ran a follower per capture session (~24 processes while
+  armed on r1) and could leave followers polling forever after a capture.
+- **adb client lifetime.** Killing the `adb shell` client ends the remote shell
+  (adbd closes the session). But on Windows a program's child processes
+  outlive it, so a closed window used to leave `adb.exe` clients, and their
+  sessions on the Omni, running. square_impact now runs its children in a job
+  object that ends them with it.
 - **Frame counter:** the VIN driver status (`/sys/kernel/debug/mpp/vi`, `frame => cnt`)
   keeps counting after the shot line, so it **can't** be used to find the
   newest buffer.

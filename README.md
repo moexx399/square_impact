@@ -97,9 +97,14 @@ Add these to the Browser Source URL, e.g. `http://localhost:8765/?gain=1.5&info=
 | `fade`  | 300     | Fade in/out time (ms) |
 | `gain`  | 1       | Brightness boost. The raw frames are dark; 1.5–2 usually looks better |
 | `info`  | off     | `info=1` shows the Omni's own numbers (ball speed, launch, direction, spin) |
+| `hold`  | 700     | Freeze on the impact frame this long (ms), on each camera; `0` for no freeze |
 
 The page is transparent while idle. Reloading it in OBS doesn't replay old shots.
 If a new shot arrives mid-playback, it replaces the current one.
+
+**Impact snapshot.** `http://localhost:8765/impact.png` always serves a still of
+the latest shot's moment of impact (see [Output](#output)). Use it in a second
+Browser Source if you want the still on screen next to the replay.
 
 ## Commands
 
@@ -188,6 +193,8 @@ Each shot is saved to `shots/<date>_<time>_shot_<boards>/` (e.g. `…_shot_r1+r2
 - `r2_cam0_<buffer>.pgm`: spin-camera frames (1280×384), the strobe-lit burst ±2
 - `meta.json`: one segment per board: frame order, contact / first lit frame,
   time offsets, the Omni's event frame
+- `impact.png`: a still of the moment of impact at full resolution: the launch
+  camera's contact frame (denoised) above the spin camera's first strobe-lit frame
 - `sheet_r1_cam0.png`, `sheet_r2_cam0.png`: contact sheets
 
 Saved files are always the full, unprocessed frames; trimming, denoising and
@@ -222,14 +229,19 @@ calibration in `/tmp/sqocam.cfg`.
   of two above the frame size), camera 0 then camera 1. They're never written
   to disk, and the DMA mappings can't be read through `/proc/PID/mem`, so
   square_impact reads physical memory with `dd if=/dev/mem`.
+- **The Omni does as little as possible.** The only thing square_impact
+  keeps running on a board is one log follower: a `tail` of
+  `/var/log/messages` plus a check every 2 s for the file being rotated. Every
+  log line streams to the PC, which does all the parsing (shot lines, event
+  buffers, r2's frame counter, the Omni's ball-speed numbers). When a shot is
+  logged the PC works out which ring buffers it needs and reads exactly those
+  with plain `dd` sessions. Nothing else runs on the Omni.
 - **A shot has ~5 s before it's gone.** After a shot, sqocam stops the
   cameras, analyses the shot, then restarts them about 5 s later, overwriting
-  the ring. square_impact watches the log *on the device*, following
-  `/var/log/messages` across its rotations. The moment
-  `sqp_bfind_shot_data return : 1` appears, it reads the event frame
-  from the preceding `sqp_bfind_fire[F, F]` line and copies just the 71
-  frames around it into `dd`'s memory. That takes a fraction of a second.
-  Streaming them to the PC can then take as long as it needs.
+  the ring. The moment `sqp_bfind_shot_data return : 1` reaches the PC, it
+  takes the event frame from the preceding `sqp_bfind_fire[F, F]` line and
+  reads the 71 frames around it. That starts a few tenths of a second after
+  the line is logged, well inside the window.
 - **Transfer speed.** This adbd only supports a terminal-style shell (no
   `exec-out`). The device's terminal processes newline-like bytes one at a
   time, and dark pixels (values 8–13) are exactly those bytes, which capped a
@@ -260,15 +272,21 @@ calibration in `/tmp/sqocam.cfg`.
 Every command sent to the Omni only reads: `/dev/mem`, `/tmp/sqocam.cfg` and
 `/var/log/messages`. Nothing is pushed, written, staged in `/tmp`, or
 reconfigured. The only process it ever stops is the `tail` it started itself
-(to follow the log across rotations), and the only setting touched is
-`stty -opost` on square_impact's own adb session terminal, which disappears
-when that session closes.
+(to follow the log across rotations, checking it with `kill -0`, which sends
+nothing), and the only setting touched is `stty -opost` on square_impact's own
+adb session terminal, which disappears when that session closes.
+
+Nothing is left behind either: square_impact's adb clients run in a Windows job
+object that ends them when it exits, however it exits (Ctrl+C, closing the
+window, a crash), and its log follower on the Omni ends itself once nothing is
+reading it.
 
 ## Performance
 
 | | Before | Now |
 |---|---|---|
 | Shot to clip on screen | 35 s+ (often missed the shot) | ~3–4 s |
+| Processes on the Omni while waiting | ~24 (r1, 4 armed sessions) | 3 (one log follower) |
 | Data pulled per shot | 64 MB (whole ring) | ~19 MB (71 frames) |
 | Transfer rate | ~2.3 MB/s | ~10 MB/s |
 | Finding contact | 0.3–0.9 s | 0.07 s |

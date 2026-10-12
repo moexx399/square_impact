@@ -113,17 +113,17 @@ class DeviceCommandsAreReadOnly(unittest.TestCase):
         r"\b(rm|mv|cp|dd\s+of=|touch|mkdir|tee|mount|umount|setprop|insmod|rmmod|reboot|"
         r"pkill|killall|chmod|chown|ln|truncate|fw_setenv|uci|sysupgrade)\b",
         r"\bof=",
-        # the log follower may only kill its own tail ($tp = the PID of the
-        # `tail` it started with &), never any other process
-        r"\bkill\b(?!\s+\$tp\b)",
+        # the log follower may only stop its own tail ($tp = the PID of the
+        # `tail` it started with &) or check it's alive (kill -0 sends nothing),
+        # never touch any other process
+        r"\bkill\b(?!\s+(-0\s+)?\$tp\b)",
     ]
 
     def commands(self):
         lay = {"nbuf": 256, "stride": 0x40000, "w": 1280, "h": 192}
-        yield si.session_cmd(lay, 0, 0, 18)
-        yield si.session_cmd(lay, 1, 40, 31, trigger=False, f_fixed=250)
-        yield si.shot_trigger("echo x")
-        yield si.event_trigger("echo x")
+        yield si.watcher_cmd()                         # the only standing command on the Omni
+        yield si.snapshot_cmd(lay, 0, 230, 71)         # r1 window, wrapping
+        yield si.shot_trigger("echo x")                # legacy grab/sample --shot
         r2 = {"nbuf": 128, "stride": 0x80000, "w": 1280, "h": 384}
         yield si.snapshot_cmd(r2, 0, 10, 16)
         yield si.snapshot_cmd(r2, 1, 120, 20)          # wraps past the end of the ring
@@ -142,20 +142,33 @@ class DeviceCommandsAreReadOnly(unittest.TestCase):
             for src in re.findall(r"\bif=(\S+)", cmd):
                 self.assertEqual(src, "/dev/mem")
 
-    @unittest.skipUnless(shutil.which("sh"), "needs a POSIX sh")
-    def test_event_trigger_parses_sqocam_log(self):
-        """The trigger ignores lines from before arming and captures the event buffer."""
+    def test_watcher_parses_the_log_on_the_host(self):
+        """Backlog lines (before the watcher started) are context only; after
+        that, r1's fire + shot lines and r2's spin line become events."""
+        import io
         lines = [
-            "Jan 1 x sqocam: ##T 5.0 time : sqp_bfind_fire[99, 99] fire(1) bgn(1), end(2)",
-            "Jan 1 x sqocam: ##T 5.4 sqp_bfind_shot_data return : 1 ",
-            "Jan 1 x sqocam: ##T 99999.1 time : sqp_bfind_fire[34, 34] fire(1) bgn(32), end(49)",
-            "Jan 1 x sqocam: ##T 99999.5 sqp_bfind_shot_data return : 1 ",
+            "9000",                                                            # uptime at start
+            "Jan 1 x sqocam: ##T 8990.0 time : sqp_bfind_fire[99, 99] fire(1) bgn(1), end(2)",
+            "Jan 1 x sqocam: ##T 8990.4 sqp_bfind_shot_data return : 1 ",       # backlog: ignored
+            "Jan 1 x ledmgr[1]: led_hb_set: [0] 1 -> 0",                        # not sqocam
+            "Jan 1 x sqocam: ##T 9010.1 time : sqp_bfind_fire[34, 34] fire(1) bgn(32), end(49)",
+            "Jan 1 x sqocam: ##T 9010.5 sqp_bfind_shot_data return : 1 ",
+            "Jan 1 x sqocam: ##T 9011.0 sim_carry input bs(1.85) ba(2.50) bd(0.60) srate((97.80) x",
+            "Jan 1 x sqocam: ##T 9020.0 sqp_sfind_main return : 1 ",
         ]
-        cmd = si.event_trigger("echo EVENT=$F").replace(
-            "U=$(cut -d. -f1 /proc/uptime)", "U=1000").replace(
-            si.FOLLOW_LOG, "printf '%s\\n' \"$@\"")
-        out = subprocess.run(["sh", "-c", cmd, "sh", *lines], capture_output=True, text=True)
-        self.assertEqual(out.stdout.strip(), "EVENT=34", out.stderr)
+        w = si.LogWatcher.__new__(si.LogWatcher)
+        w.p = type("P", (), {"stdout": io.BytesIO("".join(x + "\r\n" for x in lines).encode())})()
+        w.events, w.lines = si.queue.Queue(), si.collections.deque(maxlen=100)
+        w.started, w.last_line, w.fire = None, 0, None
+        w._run()
+        events = []
+        while not w.events.empty():
+            events.append(w.events.get())
+        self.assertEqual([(e["kind"], e.get("F"), e["t"]) for e in events],
+                         [("shot", 34, 9010.5), ("spin", None, 9020.0)])
+        self.assertEqual(len(w.history()), 6)                      # sqocam lines, backlog included
+        self.assertIn("ball speed 1.85 m/s", si.sqocam_text(w.history(), 9010.5))
+        self.assertEqual(si.sqocam_text(w.history(), 9015.0), "")  # nothing logged after that
 
     @unittest.skipUnless(os.name == "posix" and all(shutil.which(t) for t in ("sh", "tail", "ls")),
                          "needs a POSIX sh/tail/ls (MSYS on Windows can't clean up the tail)")
@@ -250,6 +263,26 @@ class Files(unittest.TestCase):
         self.assertEqual(data[0], 255)                 # first r1 frame = buffer 255, cam0
         self.assertEqual(data[2 * h], 200)             # then cam1 below it
         self.assertEqual(data[r1_bytes:r1_bytes + 8], bytes(range(8)))
+
+    def test_impact_snapshot_stacks_both_boards(self):
+        """impact.png: r1's contact frame over r2's first lit frame, full size."""
+        from unittest import mock
+        import struct
+        r1 = {"board": "r1", "cams": [0], "w": 6, "h": 2, "fps": 500.0, "idxs": [1, 2, 3],
+              "impact": 2, "frames": {0: [bytes([10]) * 12, bytes([77]) * 12, bytes([10]) * 12]}}
+        r2 = {"board": "r2", "cams": [0], "w": 4, "h": 3, "fps": 250.0, "idxs": [8, 9],
+              "impact": 9, "frames": {0: [bytes(12), bytes([200]) * 12]}}
+        with mock.patch.object(si, "DISPLAY_DENOISE", False):
+            d = si.save_shot([r1, r2])
+            path = si.write_impact_snapshot(d)
+        with open(path, "rb") as fh:
+            png = fh.read()
+        w, h = struct.unpack(">II", png[16:24])
+        self.assertEqual((w, h), (6, 2 + 6 + 3))                  # r1 rows, 6-px gap, r2 rows
+        rows = zlib.decompress(png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8])
+        self.assertEqual(rows[1], 77)                             # r1's contact frame
+        self.assertEqual(rows[(2 + 6) * 7 + 1], 200)              # r2's lit frame, padded to 6 wide
+        self.assertEqual(rows[(2 + 6) * 7 + 1 + 4], 0)
 
     def test_loads_older_single_board_folders(self):
         d = os.path.join(self.tmp, "20261011_140000_r1_shot_cam0")
@@ -367,30 +400,35 @@ class TrimClip(unittest.TestCase):
 
 
 class BoardLoopSelfHealing(unittest.TestCase):
-    """A board's capture loop must never wait forever: it re-arms when quiet,
-    and gives up on a board that's been unplugged (the manager restarts it)."""
+    """A board's capture loop must never wait forever: it restarts a watcher
+    whose adb session ended or went silent, and gives up on a board that's been
+    unplugged (the manager restarts it)."""
 
-    def run_loop(self, board, captures, connected, clock=None):
+    def run_loop(self, board, watchers, connected, clock=None):
         import queue
         from unittest import mock
         made = []
         stop = threading.Event()
         q = queue.Queue()
 
-        class FakeCapture:
-            def __init__(self, lay, cams):
+        class FakeWatcher:
+            def __init__(self, serial):
+                self.kind = watchers[len(made)]
                 made.append(self)
-                if captures[len(made) - 1] == "stop":
+                self.events = queue.Queue()
+                if self.kind == "stop":
                     stop.set()
 
-            def wait_shot(self, timeout=None):
-                return False   # nothing happened within the timeout
+            def alive(self):
+                return self.kind != "dead"
 
-            def cancel(self):
+            def stalled(self):
+                return self.kind == "silent"
+
+            def close(self):
                 pass
 
-        patches = [mock.patch.object(si, "ShotCapture", FakeCapture),
-                   mock.patch.object(si, "R2Capture", FakeCapture),
+        patches = [mock.patch.object(si, "LogWatcher", FakeWatcher),
                    mock.patch.object(si, "omni_connected", side_effect=connected),
                    mock.patch.object(si.time, "sleep")]
         if clock:
@@ -407,10 +445,10 @@ class BoardLoopSelfHealing(unittest.TestCase):
             msgs.append(q.get())
         return made, msgs
 
-    def test_rearms_after_a_quiet_period(self):
+    def test_restarts_a_dead_or_silent_watcher(self):
         for board in ("r1", "r2"):
-            made, msgs = self.run_loop(board, ["quiet", "quiet", "stop"], connected=lambda *_: True)
-            self.assertEqual(len(made), 3)                  # re-armed twice, no hang
+            made, msgs = self.run_loop(board, ["dead", "silent", "stop"], connected=lambda *_: True)
+            self.assertEqual(len(made), 3)                  # replaced twice, no hang
             self.assertEqual(msgs, [("armed", board)] * 3)
 
     def test_gives_up_on_an_unplugged_board(self):
@@ -490,7 +528,7 @@ class ShotManager(unittest.TestCase):
                 mock.patch.object(si, "device_layout", side_effect=lambda s: {"board": s, "serial": s}), \
                 mock.patch.object(si, "board_loop", fake_loop), \
                 mock.patch.object(si, "save_shot", fake_save), \
-                mock.patch.object(si, "sqocam_result", return_value=""), \
+                mock.patch.object(si, "write_impact_snapshot"), \
                 mock.patch.object(si, "write_sheets"):
             out = si.shot_manager([0], 30, lambda *m: emitted.append(m), stop, once=True)
         stop.set()

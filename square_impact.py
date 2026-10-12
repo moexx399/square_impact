@@ -51,6 +51,7 @@ Only the newest KEEP_CAPTURES (5) capture folders in shots/ are kept.
 """
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -134,6 +135,61 @@ def version_info():
 
 
 ADB = None
+_CHILDREN = []   # adb clients we started (each holds a shell session on the Omni)
+
+
+def spawn(args, **kw):
+    """Popen that's stopped when square_impact exits (see stop_children_at_exit)."""
+    p = subprocess.Popen(args, **kw)
+    _CHILDREN.append(p)
+    return p
+
+
+def stop_children_at_exit():
+    """Make sure no adb client (and so no shell session on the Omni) outlives us.
+
+    On Windows a program's child processes keep running after it exits, so a
+    closed window used to leave adb clients holding sessions open on the Omni.
+    The process joins a job object that kills its children when it ends, however
+    it ends; atexit also stops them on a normal exit. The shared adb server is
+    started first so it isn't one of them."""
+    import atexit
+    subprocess.run([ADB, "start-server"], capture_output=True)
+
+    def stop_all():
+        for c in _CHILDREN:
+            if c.poll() is None:
+                c.kill()
+    atexit.register(stop_all)
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("Basic", Basic), ("IoInfo", ctypes.c_ulonglong * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    job = k32.CreateJobObjectW(None, None)
+    info = Extended()
+    info.Basic.LimitFlags = 0x2000   # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    handle = wintypes.HANDLE(job)
+    ok = (job and k32.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info))
+          and k32.AssignProcessToJobObject(handle, wintypes.HANDLE(k32.GetCurrentProcess())))
+    if ok:
+        globals()["_JOB"] = job   # the handle must stay open for our whole lifetime
+
+
 SERIAL = None  # default device for single-board commands (set when several are connected)
 
 
@@ -180,13 +236,16 @@ def connected_boards():
 # rotated every ~25 min (ledmgr floods it). BusyBox tail -f keeps reading the
 # renamed old file, so after the first rotation no shot was ever seen again.
 # This restarts tail whenever the file's inode changes, reading the new file
-# from its start so lines written during the switch aren't lost. The only
-# process it ever kills is its own tail.
+# from its start so lines written during the switch aren't lost. When nobody is
+# reading any more, tail dies on its next write (the log is written every
+# second) and the follower exits too (`kill -0` only tests that tail is alive).
+# The only process it ever stops is its own tail.
 FOLLOW_LOG = (
     "( f=/var/log/messages; n=0; while :; do ino=$(ls -i $f 2>/dev/null); "
     "tail -n $n -f $f 2>/dev/null & tp=$!; n=+1; "
-    'while [ "$(ls -i $f 2>/dev/null)" = "$ino" ]; do sleep 1; done; '
-    "sleep 1; kill $tp; done )"
+    'while [ "$(ls -i $f 2>/dev/null)" = "$ino" ] && kill -0 $tp 2>/dev/null; '
+    "do sleep 2; done; "
+    "kill -0 $tp 2>/dev/null || exit; sleep 1; kill $tp; done )"
 )
 
 
@@ -209,7 +268,7 @@ class Stream:
         self.need = need            # payload bytes, or callable(header) -> bytes
         self.header = self.payload = self.error = None
         self.t_marker = None
-        self.p = subprocess.Popen(adb_args(serial, "shell", cmd), stdout=subprocess.PIPE)
+        self.p = spawn(adb_args(serial, "shell", cmd), stdout=subprocess.PIPE)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -330,93 +389,144 @@ CONTACT_BEFORE_F = 4  # fallback when the ball isn't seen moving
 MIN_BALL_CONTRAST = 40  # resting ball scores 70-92 vs floor; empty floor ~16
 
 
-def event_trigger(dump):
-    """Like shot_trigger, but also captures sqocam's event buffer into $F from
-    the 'sqp_bfind_fire[F, F]' line that precedes 'shot_data return : 1'."""
-    return ("U=$(cut -d. -f1 /proc/uptime); F=; "
-            + FOLLOW_LOG + " | while read l; do "
-            'case "$l" in *"fire["*|*"' + SHOT_LINE + '"*) ;; *) continue;; esac; '
-            't=${l##*##T }; t=${t%%.*}; [ "$t" -ge "$U" ] 2>/dev/null || continue; '
-            'case "$l" in '
-            '*"fire["*) F=${l#*fire[[]}; F=${F%%,*};; '
-            '*"' + SHOT_LINE + '"*) if [ -n "$F" ]; then ' + dump + '; exit; fi;; '
-            'esac; done')
+# ---------------------------------------------------------------- host-side log watching
+
+# The Omni does as little as possible: per board, one adb session follows its log
+# (FOLLOW_LOG: a tail plus a rotation check every 2 s) and streams every line to
+# the host, which does all the parsing. When a shot is logged the host works out
+# which ring buffers it needs and reads exactly those with plain `dd` sessions.
+LOG_BACKLOG = 300    # earlier lines sent when a watcher starts (context: r2's frame counter)
+LOG_STALL = 40       # seconds without any log line = stalled follower (sqocam logs every 15 s)
+SFIND_LINE = "sqp_sfind_main return : 1"
 
 
-def session_cmd(lay, cam, o0, n, trigger=True, f_fixed=None):
-    """Device command for one parallel session: on the next shot, snapshot
-    window positions [o0, o0+n) of the window that starts FETCH_BEFORE frames
-    before sqocam's event buffer F, wrapping around the ring (two spans are read
-    in parallel and emitted in time order). The header line carries F."""
+def log_uptime(line):
+    """sqocam's uptime stamp ("##T 7617.477 ...") as a float, or None."""
+    m = re.search(r"##T (\d+\.\d+)", line)
+    return float(m[1]) if m else None
+
+
+def watcher_cmd():
+    """The only standing command on the Omni: print the uptime, then follow the
+    log (with LOG_BACKLOG earlier lines as context)."""
+    return ("stty -opost; cut -d. -f1 /proc/uptime; "
+            + FOLLOW_LOG.replace("n=0;", f"n={LOG_BACKLOG};"))
+
+
+class LogWatcher:
+    """One board's log, followed on the host. Events (dicts) go to .events:
+       r1: {"kind": "shot", "F": event buffer, "t": uptime} on 'shot_data return : 1'
+       r2: {"kind": "spin", "t": uptime} on 'sqp_sfind_main return : 1'
+    Lines logged before the watcher started (the backlog) are kept as context
+    but never fire events."""
+
+    def __init__(self, serial):
+        self.p = spawn(adb_args(serial, "shell", watcher_cmd()), stdout=subprocess.PIPE)
+        self.events = queue.Queue()
+        self.lines = collections.deque(maxlen=4000)   # (uptime, line), sqocam lines only
+        self.started = None
+        self.last_line = time.time()
+        self.fire = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        for raw in self.p.stdout:
+            line = raw.decode("latin-1").strip()
+            self.last_line = time.time()
+            if self.started is None:
+                if line.isdigit():
+                    self.started = int(line)
+                continue
+            if "sqocam" not in line:
+                continue
+            t = log_uptime(line)
+            self.lines.append((t, line))
+            if t is None or t < self.started:
+                continue          # backlog: context only
+            if "fire[" in line:
+                m = re.search(r"fire\[(\d+),", line)
+                if m:
+                    self.fire = int(m[1])
+            elif SHOT_LINE in line and self.fire is not None:
+                self.events.put({"kind": "shot", "F": self.fire, "t": t, "at": time.time()})
+                self.fire = None
+            elif SFIND_LINE in line:
+                self.events.put({"kind": "spin", "t": t, "at": time.time()})
+
+    def alive(self):
+        return self.thread.is_alive() and self.p.poll() is None
+
+    def stalled(self):
+        return time.time() - self.last_line > LOG_STALL
+
+    def history(self):
+        return [line for _, line in list(self.lines)]
+
+    def close(self):
+        if self.p.poll() is None:
+            self.p.kill()
+        self.p.wait()
+
+
+def sqocam_text(lines, since=0.0):
+    """The Omni's own measurements (r1's 'sim_carry input' line) logged at or
+    after uptime `since`, as text; '' if there aren't any."""
+    for line in reversed(lines):
+        if "sim_carry input" in line and (log_uptime(line) or 0) >= since:
+            vals = dict(re.findall(r"(\w+)\(\(?(-?[\d.]+)\)", line))
+            return (f"sqocam: ball speed {vals.get('bs', '?')} m/s, launch {vals.get('ba', '?')} deg, "
+                    f"direction {vals.get('bd', '?')} deg, spin {vals.get('srate', '?')} rpm")
+    return ""
+
+
+def log_trigger(pattern, dump):
+    """Device-side trigger, used only by the legacy `grab/sample --shot`: run
+    `dump` the moment a log line containing `pattern` is written after arming.
+    $T is that line's uptime stamp ("7617.477")."""
+    return ("U=$(cut -d. -f1 /proc/uptime); "
+            f"{FOLLOW_LOG} | while read l; do "
+            f'case "$l" in *"{pattern}"*) ;; *) continue;; esac; '
+            'T=${l##*##T }; T=${T%% *}; t=${T%%.*}; '
+            f'if [ "$t" -ge "$U" ] 2>/dev/null; then {dump}; exit; fi; done')
+
+
+def snapshot_cmd(lay, cam, start, n):
+    """Device command: MARKER line, then buffers start..start+n-1 (wrapping
+    around the ring) of one camera, both spans read in parallel. Just `dd`."""
     nb, st = lay["nbuf"], lay["stride"]
     base = FRAME_BASE + cam * nb * st
-    dump = (
-        (f"F={f_fixed}; " if f_fixed is not None else "")
-        + f"S=$(( (F - {FETCH_BEFORE} + {o0} + 4 * {nb}) % {nb} )); "
-        f"snap() {{ dd if=/dev/mem bs=$(($2 * {st})) count=1 iflag=skip_bytes "
-        f"skip=$(({base} + $1 * {st})) 2>/dev/null; }}; "
-        f"echo {MARKER.decode()} $F; "
-        f"if [ $((S + {n})) -le {nb} ]; then snap $S {n}; "
-        f"else snap 0 $((S + {n} - {nb})) | (snap $S $(({nb} - S)); cat); fi"
-    )
-    return "stty -opost; " + (event_trigger(dump) if trigger else dump)
+
+    def snap(b, k):
+        return f"dd if=/dev/mem bs={k * st} count=1 iflag=skip_bytes skip={base + b * st} 2>/dev/null"
+    start %= nb
+    first = min(n, nb - start)
+    body = snap(start, first) if first == n else f"{snap(0, n - first)} | ({snap(start, first)}; cat)"
+    return f"stty -opost; echo {MARKER.decode()}; {body}"
 
 
-class ShotCapture:
-    """r1 (launch board): arm parallel sessions for the next shot; each
-    snapshots its share of the window around sqocam's event buffer the moment
-    the shot is logged (a few MB each, read in a fraction of a second, well
-    inside the ~5 s before the cameras restart). result() blocks until fetched."""
-
-    def __init__(self, lay, cams, parts=SESSIONS, f_fixed=None):
-        self.lay, self.cams = lay, cams
-        self.n = FETCH_BEFORE + 1 + FETCH_AFTER
-        bounds = [self.n * k // parts for k in range(parts + 1)]
-        self.parts = [(cam, o0, o1 - o0,
-                       Stream(session_cmd(lay, cam, o0, o1 - o0, f_fixed is None, f_fixed),
-                              (o1 - o0) * lay["stride"], lay.get("serial")))
-                      for cam in cams for o0, o1 in zip(bounds, bounds[1:])]
-
-    def streams(self):
-        return [s for *_, s in self.parts]
-
-    def cancel(self):
-        for s in self.streams():
-            s.kill()
-
-    def wait_shot(self, timeout=None):
-        """Block until the shot is detected (first marker seen) or a session dies.
-        Returns False if `timeout` seconds pass with neither."""
-        return wait_any(self.streams(), timeout)
-
-    def result(self):
-        """Frames per camera in time order, with their buffer numbers."""
-        st, fb, nb = self.lay["stride"], self.lay["w"] * self.lay["h"], self.lay["nbuf"]
-        frames = {cam: [None] * self.n for cam in self.cams}
-        events = set()
-        for cam, o0, n, s in self.parts:
-            header, data = s.result()
-            events.add(int(header))
-            for j in range(n):
-                frames[cam][o0 + j] = data[j * st:j * st + fb]
-        if len(events) > 1:
-            raise RuntimeError(f"sessions saw different events {sorted(events)}")
-        F = events.pop()
-        t_shot = min(s.t_marker for s in self.streams())
-        return {"frames": frames, "event": F,
-                "buffers": [(F - FETCH_BEFORE + p) % nb for p in range(self.n)],
-                "t_shot": t_shot, "t_fetched": time.time()}
+def fetch_window(lay, cams, start, n, parts=SESSIONS):
+    """Read ring buffers start..start+n-1 (wrapping) of each camera with
+    parallel adb sessions. Returns ({cam: [frames in order]}, [buffers])."""
+    nb, st, fb = lay["nbuf"], lay["stride"], lay["w"] * lay["h"]
+    bounds = [n * k // parts for k in range(parts + 1)]
+    jobs = [(cam, o0, o1 - o0, Stream(snapshot_cmd(lay, cam, start + o0, o1 - o0),
+                                      (o1 - o0) * st, lay.get("serial")))
+            for cam in cams for o0, o1 in zip(bounds, bounds[1:])]
+    frames = {cam: [None] * n for cam in cams}
+    for cam, o0, k, s in jobs:
+        _, data = s.result()
+        for j in range(k):
+            frames[cam][o0 + j] = data[j * st:j * st + fb]
+    return frames, [(start + p) % nb for p in range(n)]
 
 
-def wait_any(streams, timeout=None):
-    """True once any stream has seen its marker (or died); False on timeout."""
-    end = None if timeout is None else time.time() + timeout
-    while end is None or time.time() < end:
-        for s in streams:
-            if s.t_marker or not s.thread.is_alive():
-                return True
-        time.sleep(0.01)
-    return False
+def capture_r1(lay, cams, event):
+    """r1: the FETCH_BEFORE/FETCH_AFTER window around sqocam's event buffer F."""
+    F = event["F"]
+    frames, buffers = fetch_window(lay, cams, F - FETCH_BEFORE, FETCH_BEFORE + 1 + FETCH_AFTER)
+    return {"frames": frames, "event": F, "buffers": buffers,
+            "t_shot": event["at"], "t_fetched": time.time()}
 
 
 # ---------------------------------------------------------------- r2 (spin board)
@@ -429,36 +539,11 @@ def wait_any(streams, timeout=None):
 #   sqp_sfind_main return : 1                 spin analysis done = a real shot
 # and keeps the ring for 6-20 s. buffer = frame# % nbuf, so the counter line plus
 # the stop time give the newest buffer; the lit burst sits ~44-51 frames before it.
-SFIND_LINE = "sqp_sfind_main return : 1"
 R2_LIT_BEFORE_NEWEST = 48   # centre of the lit burst, in frames before the newest buffer
 R2_WINDOW = 64              # frames fetched around it (the whole ring if unknown)
 R2_LIT_LEVEL = 150          # a pixel this bright is strobe-lit (the unlit scene sits ~11)
 R2_LIT_MIN = 4              # lit pixels (in a 1-in-53 sample) for a frame to count as lit
 R2_PAD = 2                  # unlit frames kept either side of the burst
-
-
-def log_trigger(pattern, dump):
-    """Run `dump` the moment a log line containing `pattern` is written after
-    arming. $T is that line's uptime stamp ("7617.477")."""
-    return ("U=$(cut -d. -f1 /proc/uptime); "
-            f"{FOLLOW_LOG} | while read l; do "
-            f'case "$l" in *"{pattern}"*) ;; *) continue;; esac; '
-            'T=${l##*##T }; T=${T%% *}; t=${T%%.*}; '
-            f'if [ "$t" -ge "$U" ] 2>/dev/null; then {dump}; exit; fi; done')
-
-
-def snapshot_cmd(lay, cam, start, n):
-    """Device command: MARKER line, then buffers start..start+n-1 (wrapping
-    around the ring) of one camera, both spans read in parallel."""
-    nb, st = lay["nbuf"], lay["stride"]
-    base = FRAME_BASE + cam * nb * st
-
-    def snap(b, k):
-        return f"dd if=/dev/mem bs={k * st} count=1 iflag=skip_bytes skip={base + b * st} 2>/dev/null"
-    start %= nb
-    first = min(n, nb - start)
-    body = snap(start, first) if first == n else f"{snap(0, n - first)} | ({snap(start, first)}; cat)"
-    return f"stty -opost; echo {MARKER.decode()}; {body}"
 
 
 def r2_newest_buffer(log_lines, t_shot, fps, nbuf):
@@ -488,53 +573,17 @@ def lit_frames(frames):
             if sum(1 for v in f[::53] if v > R2_LIT_LEVEL) >= R2_LIT_MIN]
 
 
-class R2Capture:
-    """r2 (spin board): wait for sqocam's 'spin analysis done' line, work out
-    where the strobe-lit burst is in the ring from its log, then snapshot that
-    window with parallel sessions. r2 keeps its ring for 6-20 s after the stop,
-    so there's time to look before reading."""
-
-    def __init__(self, lay, cams, parts=SESSIONS):
-        self.lay, self.cams, self.parts = lay, cams, parts
-        self.trigger = Stream("stty -opost; " + log_trigger(SFIND_LINE, f"echo {MARKER.decode()} $T"),
-                              0, lay.get("serial"))
-        self.snaps = []
-
-    def streams(self):
-        return [self.trigger] + [s for *_, s in self.snaps]
-
-    def cancel(self):
-        for s in self.streams():
-            s.kill()
-
-    def wait_shot(self, timeout=None):
-        return wait_any([self.trigger], timeout)
-
-    def result(self):
-        lay, nb, fps = self.lay, self.lay["nbuf"], self.lay["fps"]
-        header, _ = self.trigger.result()
-        t_shot = float(header)
-        log = shell("cat /tmp/log/messages.0 /tmp/log/messages 2>/dev/null | grep sqocam | "
-                    "grep -E 'sqp_grab_stop| [0-9]+ [0-9]+ \\( '", lay.get("serial")).splitlines()
-        newest = r2_newest_buffer(log, t_shot, fps, nb)
-        if newest is None:   # fall back to the whole ring, in buffer order
-            start, n, ordered = 0, nb, False
-        else:
-            start, n, ordered = newest - R2_LIT_BEFORE_NEWEST - R2_WINDOW // 2, R2_WINDOW, True
-        bounds = [n * k // self.parts for k in range(self.parts + 1)]
-        self.snaps = [(cam, o0, o1 - o0,
-                       Stream(snapshot_cmd(lay, cam, start + o0, o1 - o0),
-                              (o1 - o0) * lay["stride"], lay.get("serial")))
-                      for cam in self.cams for o0, o1 in zip(bounds, bounds[1:])]
-        st, fb = lay["stride"], lay["w"] * lay["h"]
-        frames = {cam: [None] * n for cam in self.cams}
-        for cam, o0, k, s in self.snaps:
-            _, data = s.result()
-            for j in range(k):
-                frames[cam][o0 + j] = data[j * st:j * st + fb]
-        return {"frames": frames, "buffers": [(start + p) % nb for p in range(n)],
-                "ordered": ordered, "newest": newest, "t_shot": self.trigger.t_marker,
-                "t_fetched": time.time()}
+def capture_r2(lay, cams, event, log_lines):
+    """r2: locate the lit burst from the log (host-side), then read that window."""
+    nb = lay["nbuf"]
+    newest = r2_newest_buffer(log_lines, event["t"], lay["fps"], nb)
+    if newest is None:   # fall back to the whole ring, in buffer order
+        start, n, ordered = 0, nb, False
+    else:
+        start, n, ordered = newest - R2_LIT_BEFORE_NEWEST - R2_WINDOW // 2, R2_WINDOW, True
+    frames, buffers = fetch_window(lay, cams, start, n)
+    return {"frames": frames, "buffers": buffers, "ordered": ordered, "newest": newest,
+            "t_shot": event["at"], "t_fetched": time.time()}
 
 
 def r2_segment(lay, cap):
@@ -568,19 +617,6 @@ def r2_segment(lay, cap):
 
 class NoBall(Exception):
     """sqocam reported a shot, but there's no ball in view around it."""
-
-
-def sqocam_result(serial=None):
-    """sqocam's own measurements for the latest shot (logged by r1), if any."""
-    try:
-        line = shell("grep 'sim_carry input' /var/log/messages | tail -1", serial)
-    except (OSError, subprocess.CalledProcessError):
-        return ""
-    vals = dict(re.findall(r"(\w+)\(\(?(-?[\d.]+)\)", line))
-    if not vals:
-        return ""
-    return (f"sqocam: ball speed {vals.get('bs', '?')} m/s, launch {vals.get('ba', '?')} deg, "
-            f"direction {vals.get('bd', '?')} deg, spin {vals.get('srate', '?')} rpm")
 
 
 def r1_segment(lay, cap, pad):
@@ -663,6 +699,37 @@ def prune_captures(keep=KEEP_CAPTURES):
     dirs = sorted(d for d in glob.glob(os.path.join(SHOTS_DIR, "*")) if os.path.isdir(d))
     for d in dirs[:-keep]:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def write_impact_snapshot(out_dir):
+    """impact.png: a still of the moment of impact, full frame, one per board
+    stacked (launch camera's contact frame, denoised, over the spin camera's
+    first strobe-lit frame). Returns its path, or None if no board has one."""
+    rows, width = [], 0
+    for s in load_shot(out_dir):
+        if s.get("impact") not in s["idxs"]:
+            continue
+        cam = s["cams"][0]
+        frames, i = s["frames"][cam], s["idxs"].index(s["impact"])
+        if s["board"] == "r1" and DISPLAY_DENOISE:   # average with the frames around contact
+            lo = max(0, i - 3)
+            f = denoise(frames[lo:i + 4], parallel=False)[i - lo]
+        else:
+            f = frames[i]
+        rows.append((s["w"], s["h"], f))
+        width = max(width, s["w"])
+    if not rows:
+        return None
+    gap = 6
+    px = bytearray()
+    for k, (w, h, f) in enumerate(rows):
+        if k:
+            px += b"\xff" * (width * gap)
+        for y in range(h):
+            px += f[y * w:(y + 1) * w] + bytes(width - w)
+    path = os.path.join(out_dir, "impact.png")
+    write_png(path, width, len(px) // width, bytes(px))
+    return path
 
 
 def write_sheets(out_dir):
@@ -1284,12 +1351,12 @@ def view(shot_dir=None):
 
 # ---------------------------------------------------------------- capture loops
 
-REARM_AFTER = 300   # seconds without a shot before a board's sessions are re-armed
 PAIR_WINDOW = 8.0   # seconds to wait for the other board's capture of the same shot
+SQOCAM_RESULT_WAIT = 1.5  # r1 logs its measurements ~0.5 s after the shot line
 
 
 def omni_connected(serial=None):
-    """True if adb sees that board right now."""
+    """True if adb sees that board right now (asks the host's adb server only)."""
     try:
         out = subprocess.run(adb_args(serial, "get-state"), capture_output=True, text=True, timeout=5)
         return out.stdout.strip() == "device"
@@ -1298,52 +1365,62 @@ def omni_connected(serial=None):
 
 
 def board_loop(lay, cams, pad, out_q, stop):
-    """Arm/capture loop for one board (r1 launch or r2 spin). Reports to out_q:
-    ("armed"|"fetching", board), ("segment", board, seg, summary, notes, t_shot),
-    ("ignored"|"error", board, text), ("gone", board).
+    """Capture loop for one board (r1 launch or r2 spin), driven by a LogWatcher.
+    Reports to out_q: ("armed"|"fetching", board),
+    ("segment", board, seg, summary, notes, t_shot), ("ignored"|"error", board, text),
+    ("gone", board).
 
-    Self-healing: re-arms after REARM_AFTER quiet seconds (clears any silently
-    stalled adb session), and exits if the board is gone for 10 s (the manager
-    starts a new loop when it comes back)."""
+    Self-healing: the watcher is restarted if its adb session ends or goes
+    silent for LOG_STALL seconds (sqocam logs every 15 s, so silence = stalled),
+    and the loop exits if the board is gone for 10 s (the manager starts a new
+    one when it comes back)."""
     board, serial = lay["board"], lay["serial"]
-    gone_since = None
-    while not stop.is_set():
-        cap = None
-        try:
-            if not omni_connected(serial):
-                gone_since = gone_since or time.time()
-                if time.time() - gone_since > 10:
-                    out_q.put(("gone", board))
-                    return
-                time.sleep(2)
-                continue
-            gone_since = None
-            cap = R2Capture(lay, cams) if board == "r2" else ShotCapture(lay, cams)
-            out_q.put(("armed", board))
-            if not cap.wait_shot(timeout=REARM_AFTER) or stop.is_set():
+    gone_since, watcher = None, None
+    try:
+        while not stop.is_set():
+            if watcher is None or not watcher.alive() or watcher.stalled():
+                if watcher:
+                    watcher.close()
+                    watcher = None
+                if not omni_connected(serial):
+                    gone_since = gone_since or time.time()
+                    if time.time() - gone_since > 10:
+                        out_q.put(("gone", board))
+                        return
+                    time.sleep(2)
+                    continue
+                gone_since = None
+                watcher = LogWatcher(serial)
+                out_q.put(("armed", board))
+            try:
+                event = watcher.events.get(timeout=1)
+            except queue.Empty:
                 continue
             out_q.put(("fetching", board))
-            res = cap.result()
-            cap.cancel()
-            if board == "r2":
-                seg, summary = r2_segment(lay, res)
-                notes = []
-            else:
-                seg, summary, notes = r1_segment(lay, res, pad)
-            out_q.put(("segment", board, seg, summary, notes, res["t_shot"]))
-        except NoBall as e:
-            out_q.put(("ignored", board, str(e)))
-        except Exception as e:  # noqa: BLE001 - keep the loop alive, report the error
-            if stop.is_set():
-                break
-            if not omni_connected(serial):
-                continue
-            traceback.print_exc()
-            out_q.put(("error", board, str(e)))
-            time.sleep(1)
-        finally:
-            if cap:
-                cap.cancel()
+            try:
+                if board == "r2":
+                    seg, summary = r2_segment(lay, capture_r2(lay, cams, event, watcher.history()))
+                    notes = []
+                else:
+                    cap = capture_r1(lay, cams, event)
+                    seg, summary, notes = r1_segment(lay, cap, pad)
+                    end = time.time() + SQOCAM_RESULT_WAIT
+                    while not sqocam_text(watcher.history(), event["t"]) and time.time() < end:
+                        time.sleep(0.1)
+                    seg["sqocam"] = sqocam_text(watcher.history(), event["t"])
+                out_q.put(("segment", board, seg, summary, notes, event["at"]))
+            except NoBall as e:
+                out_q.put(("ignored", board, str(e)))
+            except Exception as e:  # noqa: BLE001 - keep the loop alive, report the error
+                if stop.is_set():
+                    break
+                if omni_connected(serial):
+                    traceback.print_exc()
+                    out_q.put(("error", board, str(e)))
+            out_q.put(("armed", board))
+    finally:
+        if watcher:
+            watcher.close()
 
 
 def shot_manager(cams, pad, emit, stop, once=False):
@@ -1370,11 +1447,16 @@ def shot_manager(cams, pad, emit, stop, once=False):
 
     def finish():
         segs = [p[1] for p in sorted(pending, key=lambda p: p[0])]   # r1 before r2
-        info = sqocam_result(serials.get("r1") or serials.get(segs[0]["board"]))
+        info = next((s.get("sqocam") for s in segs if s.get("sqocam")), "")
         out_dir = save_shot(segs, info)
         summary = "  |  ".join(p[2] + "".join("; " + n for n in p[3]) for p in pending)
         emit("shot", out_dir, summary, min(p[4] for p in pending), info)
-        threading.Thread(target=write_sheets, args=(out_dir,), daemon=True).start()
+
+        def extras():   # not on the critical path: the clip is already showing
+            write_impact_snapshot(out_dir)
+            emit("snapshot", out_dir)
+            write_sheets(out_dir)
+        threading.Thread(target=extras, daemon=True).start()
         return out_dir
 
     while not stop.is_set():
@@ -1426,7 +1508,12 @@ def shot_once(cams, pad):
     stop = threading.Event()
 
     def emit(kind, *a):
-        print(a[0] if kind == "status" else f"{a[1]}\nsaved {a[0]}", flush=True)
+        if kind == "status":
+            print(a[0], flush=True)
+        elif kind == "snapshot":
+            print(f"impact snapshot: {os.path.join(a[0], 'impact.png')}", flush=True)
+        else:
+            print(f"{a[1]}\nsaved {a[0]}", flush=True)
     try:
         return shot_manager(cams, pad, emit, stop, once=True)
     finally:
@@ -1450,6 +1537,8 @@ def live(cams, pad):
                 msg = q.get_nowait()
                 if msg[0] == "status":
                     shown["state"] = msg[1]
+                elif msg[0] == "snapshot":
+                    pass
                 else:
                     _, out_dir, summary, t_shot, info = msg
                     v.load(out_dir)
@@ -1493,12 +1582,13 @@ OVERLAY_PAGE = r"""<!doctype html>
 <body><div id="wrap"><canvas id="c"></canvas><div id="info"></div></div>
 <script>
 // URL options: fps (launch-camera playback speed, default 30), fps2 (spin-camera
-// close-up, default 10), loops (2), gap (ms between loops, 250), fade (ms, 300),
+// close-up, default 10), hold (ms to freeze on the impact frame, 700; 0 = no
+// freeze), loops (2), gap (ms between loops, 250), fade (ms, 300),
 // gain (brightness multiplier, 1), info=1 (show sqocam's numbers)
 const P = new URLSearchParams(location.search);
 const FPS = +P.get('fps') || 30, FPS2 = +P.get('fps2') || 10, LOOPS = +P.get('loops') || 2,
       GAP = +(P.get('gap') ?? 250), FADE = +P.get('fade') || 300, GAIN = +P.get('gain') || 1,
-      INFO = P.get('info') === '1';
+      INFO = P.get('info') === '1', HOLD = +(P.get('hold') ?? 700);
 document.documentElement.style.setProperty('--fade', FADE + 'ms');
 const wrap = document.getElementById('wrap'), cv = document.getElementById('c'),
       ctx = cv.getContext('2d'), infoEl = document.getElementById('info');
@@ -1516,7 +1606,10 @@ async function show(s) {
   const tl = []; let off = 0, t = 0;
   for (const g of s.segments) {
     const ms = 1000 / (g.board === 'r2' ? FPS2 : FPS);
-    for (let f = 0; f < g.n; f++) { tl.push({ g, o: off + f * g.w * g.h, start: t }); t += ms; }
+    for (let f = 0; f < g.n; f++) {
+      tl.push({ g, o: off + f * g.w * g.h, start: t });
+      t += ms + (f === g.impact ? HOLD : 0);    // snapshot: freeze on the moment of impact
+    }
     off += g.n * g.w * g.h;
   }
   const loopMs = t + GAP;
@@ -1564,8 +1657,12 @@ class Overlay:
         self.shots = {}       # seq -> (header dict, frame bytes); last few kept
         self.current = None
 
-    def publish(self, header, data, announce=True):
+    shot_dir = None   # folder of the latest shot, for /impact.png
+
+    def publish(self, header, data, announce=True, shot_dir=None):
         with self.cond:
+            if shot_dir:
+                self.shot_dir = shot_dir
             if announce:
                 self.seq += 1
             seq = self.seq
@@ -1590,7 +1687,7 @@ def overlay_payload(out_dir, info=""):
     each segment's frames in play order, segments one after another."""
     segs = display_segments(out_dir)
     header = {"segments": [{"board": s["board"], "w": s["w"], "h": s["h"], "n": len(s["frames"]),
-                            "impact": s["impact"] or 0} for s in segs],
+                            "impact": s["impact"]} for s in segs],
               "info": info, "name": os.path.basename(out_dir)}
     return header, b"".join(b"".join(s["frames"]) for s in segs)
 
@@ -1614,6 +1711,12 @@ def serve_overlay(ov, port):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 return self.send(200, "text/html; charset=utf-8", OVERLAY_PAGE.encode())
+            if path == "/impact.png":   # still of the latest shot's moment of impact
+                snap = ov.shot_dir and os.path.join(ov.shot_dir, "impact.png")
+                if not snap or not os.path.exists(snap):
+                    return self.send(404, "text/plain", b"no snapshot yet\n")
+                with open(snap, "rb") as fh:
+                    return self.send(200, "image/png", fh.read())
             if path == "/replay":
                 ok = ov.replay()
                 return self.send(200 if ok else 404, "text/plain",
@@ -1659,7 +1762,8 @@ def obs(cams, pad, port):
     if DISPLAY_DENOISE:
         warm_up_pool()
     try:  # last saved shot, so /replay works for positioning before any new shot
-        ov.publish(*overlay_payload(latest_capture()), announce=False)
+        last = latest_capture()
+        ov.publish(*overlay_payload(last), announce=False, shot_dir=last)
     except (SystemExit, OSError, ValueError, KeyError):
         pass
     url = f"http://localhost:{port}/"
@@ -1667,15 +1771,18 @@ def obs(cams, pad, port):
           f"  size 1280x384 or 640x192 (10:3; with --crop full on the launch camera, 20:3)\n"
           f"  options: {url}?fps=30&fps2=10&loops=2&gain=1.5&info=1\n"
           f"  re-show the last shot (for positioning): {url}replay\n"
+          f"  still of the latest impact: {url}impact.png\n"
           f"Ctrl+C to stop.", flush=True)
     stop = threading.Event()
 
     def emit(kind, *a):
         if kind == "status":
             print(a[0], flush=True)
+        elif kind == "snapshot":
+            print(f"impact snapshot: {os.path.join(a[0], 'impact.png')}", flush=True)
         else:
             out_dir, summary, t_shot, info = a
-            ov.publish(*overlay_payload(out_dir, info))
+            ov.publish(*overlay_payload(out_dir, info), shot_dir=out_dir)
             print(f"{summary}; on overlay {time.time() - t_shot:.1f}s after shot", flush=True)
             if info:
                 print(info, flush=True)
@@ -1961,6 +2068,7 @@ def run(a):
         d = impact(a.arg, a.pad)
         return None if a.no_view else view(d)
     ADB = find_adb()
+    stop_children_at_exit()
     cam_map = {"0": [0], "top": [0], "1": [1], "bottom": [1], "both": [0, 1]}
     if a.cmd in ("obs", "live", "shot"):
         cams = cam_map[a.cam or "top"]
