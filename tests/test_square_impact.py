@@ -657,6 +657,40 @@ class Logo(unittest.TestCase):
             self.assertEqual(bpp, 32)
             self.assertEqual(ico[off:off + n], si.logo_png(size))
 
+    def test_console_logo_is_square(self):
+        lines = si.logo_lines(14)
+        self.assertEqual(len(lines), 7)                   # two pixel rows per text line
+        for line in lines:
+            self.assertEqual(len(re.sub(r"\033\[[0-9;]*m", "", line)), 14)
+
+    def test_banner_is_plain_when_redirected(self):
+        import contextlib
+        import io
+        buf = io.StringIO()   # not a tty: no logo, no escape codes
+        with contextlib.redirect_stdout(buf):
+            si.banner("live")
+        self.assertIn("square_impact", buf.getvalue())
+        self.assertNotIn("\033", buf.getvalue())
+        self.assertNotIn("▀", buf.getvalue())
+
+    def test_no_logo_on_a_terminal_without_colour(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        class Terminal(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        buf = Terminal()
+        with contextlib.redirect_stdout(buf), mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            si.banner("live")
+        self.assertIn("square_impact", buf.getvalue())
+        self.assertNotIn("\033", buf.getvalue())
+        self.assertNotIn("▀", buf.getvalue())
+
     def test_overlay_serves_favicon(self):
         import urllib.request
         srv = si.serve_overlay(si.Overlay(), 0)   # port 0: any free port

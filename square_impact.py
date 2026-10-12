@@ -1901,35 +1901,96 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
 }
 
 
+def colour_available():
+    """True when stdout is a terminal that will show colour: not redirected, not
+    NO_COLOR (https://no-color.org), not TERM=dumb, and on Windows a console
+    that accepts escape-code processing (older consoles would print the codes
+    as text)."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        out, mode = k32.GetStdHandle(-11), wintypes.DWORD()   # STD_OUTPUT_HANDLE
+        if not k32.GetConsoleMode(out, ctypes.byref(mode)):
+            return False
+        return bool(k32.SetConsoleMode(out, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (AttributeError, OSError):
+        return False
+
+
 def paint(code, s):
-    """ANSI colour on a real terminal, plain text when redirected."""
-    return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else s
+    """ANSI colour when the terminal shows it, plain text otherwise."""
+    return f"\033[{code}m{s}\033[0m" if colour_available() else s
+
+
+def logo_lines(size=14):
+    """The logo as terminal text: each '▀' cell is two pixels, the top one in the
+    foreground colour and the bottom one in the background colour, so it comes
+    out square (cells are about twice as tall as wide). 24-bit colour."""
+    px = logo_rgba(size)
+    pixel = lambda x, y: px[(y * size + x) * 4:(y * size + x) * 4 + 4]
+    rgb = lambda c: ";".join(map(str, c))
+    lines = []
+    for y in range(0, size, 2):
+        line = ""
+        for x in range(size):
+            (*top, ta), (*bot, ba) = pixel(x, y), pixel(x, y + 1)
+            if ta < 128 and ba < 128:   # rounded corners: leave the terminal's own background
+                line += "\033[0m "
+            elif ta < 128:
+                line += f"\033[0;38;2;{rgb(bot)}m▄"
+            elif ba < 128:
+                line += f"\033[0;38;2;{rgb(top)}m▀"
+            else:
+                line += f"\033[38;2;{rgb(top)};48;2;{rgb(bot)}m▀"
+        lines.append(line + "\033[0m")
+    return lines
+
+
+def fancy_terminal():
+    """The logo is drawn in colour, so it's only shown when colour is available
+    and the console can print the block characters."""
+    if not colour_available():
+        return False
+    try:
+        "▀▄╭".encode(sys.stdout.encoding or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
 
 
 def banner(cmd):
-    """Startup header."""
-    if os.name == "nt":
-        os.system("")  # turns on ANSI escape handling in the classic Windows console
+    """Startup header: the logo (colour terminals only) with the title box beside it."""
     try:
         sys.stdout.reconfigure(errors="replace")  # never crash on a non-UTF-8 console
     except (AttributeError, ValueError):
         pass
-    title = f"◉  square_impact  v{VERSION}"
-    tagline = "   instant high-speed replays from the Square Omni"
+    title = f"square_impact  v{VERSION}"
+    tagline = "instant high-speed replays from the Square Omni"
     width = max(len(title), len(tagline)) + 4
     edge = paint("2", "│")
-    print(paint("2", "╭" + "─" * width + "╮"))
-    print(f"{edge}  {paint('1;92', title)}{' ' * (width - len(title) - 2)}{edge}")
-    print(f"{edge}  {tagline}{' ' * (width - len(tagline) - 2)}{edge}")
-    print(paint("2", "╰" + "─" * width + "╯"))
-    print(paint("2", f"  mode: {MODE_TEXT.get(cmd, cmd)}  ·  read-only  ·  Ctrl+C to stop"))
+    text = [paint("2", "╭" + "─" * width + "╮"),
+            f"{edge}  {paint('1;92', title)}{' ' * (width - len(title) - 2)}{edge}",
+            f"{edge}  {tagline}{' ' * (width - len(tagline) - 2)}{edge}",
+            paint("2", "╰" + "─" * width + "╯"),
+            paint("2", f"  mode: {MODE_TEXT.get(cmd, cmd)}  ·  read-only  ·  Ctrl+C to stop")]
+    if fancy_terminal():
+        logo = logo_lines()
+        top = (len(logo) - len(text)) // 2   # centre the text beside the logo
+        text = [""] * top + text + [""] * (len(logo) - len(text) - top)
+        text = [f"  {art}  {line}" for art, line in zip(logo, text)]
+    print("\n".join(text))
     print(flush=True)
 
 

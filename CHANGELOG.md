@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.9.0 - 2026-10-12
+### Added
+* The console header now shows the logo beside the title (on terminals with colour; plain text when output is redirected or NO_COLOR is set)
+
 ## v0.8.0 - 2026-10-12
 ### Added
 * App logo: shown on the viewer window, in the taskbar and Alt+Tab, as the OBS overlay page's favicon, and as the exe's icon
