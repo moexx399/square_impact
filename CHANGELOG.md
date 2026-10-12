@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.4.0 - 2026-10-11
+### Added
+* `obs` and `live` re-arm every 5 minutes without a shot and wait for the Omni to reconnect if it sleeps, reboots or is unplugged
+* `--crop left|right|full` for the OBS overlay and viewers; defaults to the left half (640x192), where the ball and club are. Saved clips keep the full frame
+* `square_impact.exe update` downloads the latest release from GitHub, verifies its SHA-256, and replaces the exe
+### Fixed
+* Long sessions stopped catching shots after ~25 minutes: the Omni rotates its log file and the shot trigger kept reading the old one. The log is now followed across rotations
+
 ## v0.3.0 - 2026-10-11
 ### Added
 * The exe checks GitHub for a newer release at startup (in the background, at most daily) and prints a link; turn off with --no-update-check or SQUARE_IMPACT_NO_UPDATE_CHECK=1

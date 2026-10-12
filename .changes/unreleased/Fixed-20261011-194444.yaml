@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Long sessions stopped catching shots after ~25 minutes: the Omni rotates its log file and the shot trigger kept reading the old one. The log is now followed across rotations'
-time: 2026-10-11T19:44:44.3705013-05:00
