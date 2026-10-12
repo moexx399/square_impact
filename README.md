@@ -112,6 +112,9 @@ common options:
                           (default left; saved clips always keep the full frame)
   --trim-front FRACTION   drop the start of each clip, where the club is still on
                           its way in (default 0.2 = first 12 of 61 frames; 0 shows all)
+  --trim-back FRACTION    drop the end of each clip, where the ball is rolling away
+                          (default 0.2 = last 12 frames). With both defaults a clip
+                          is 37 frames: contact ±18 frames (±36 ms)
   --pad N                 frames kept before and after contact (default 30)
   --no-update-check       skip the check for a newer release (exe only)
 ```

@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.6.0 - 2026-10-11
+### Changed
+* The OBS overlay and viewers also skip the last 20% of each clip (ball rolling away), so clips are contact +/-18 frames; `--trim-back` adjusts it and saved clips keep every frame
+
 ## v0.5.0 - 2026-10-11
 ### Changed
 * The OBS overlay and viewers skip the first 20% of each clip (club not yet moving), so playback starts closer to the action; `--trim-front` adjusts it and saved clips keep every frame

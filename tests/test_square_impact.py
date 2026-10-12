@@ -230,9 +230,10 @@ class Files(unittest.TestCase):
         self.assertEqual(data[0], 254)
         self.assertEqual(data[w * h], 200)
         self.assertEqual(data[2 * w * h], 255)
-        # trimming the front quarter drops the first frame (buffer 254)
-        header, data = si.overlay_payload(d, "info", trim=0.25)
-        self.assertEqual((header["n"], header["impact"]), (3, 1))
+        # trimming a quarter off each end drops buffers 254 and 1
+        header, data = si.overlay_payload(d, "info", trim=(0.25, 0.25))
+        self.assertEqual((header["n"], header["impact"]), (2, 1))
+        self.assertEqual(len(data), 2 * w * h * 2)
         self.assertEqual(data[0], 255)
 
     def test_png_writer(self):
@@ -256,7 +257,7 @@ class Crop(unittest.TestCase):
         self.assertIs(si.crop_frame(f, w, h, *si.crop_columns(w, "full")), f)
 
 
-class TrimFront(unittest.TestCase):
+class TrimClip(unittest.TestCase):
     def clip_meta(self, n=61, contact=30):
         idxs = [(200 + i) % 256 for i in range(n)]   # wraps around the ring
         return {"idxs": idxs, "impact": idxs[contact],
@@ -264,7 +265,7 @@ class TrimFront(unittest.TestCase):
                 "motion": [[0] + [i % 7 for i in range(1, n)]]}
 
     def test_drops_first_20_percent(self):
-        m = si.trim_front(self.clip_meta(), 0.2)
+        m = si.trim_clip(self.clip_meta(), front=0.2)
         self.assertEqual(len(m["idxs"]), 49)              # 12 of 61 frames dropped
         self.assertEqual(m["idxs"][0], 212)
         self.assertEqual(m["idxs"].index(m["impact"]), 18)
@@ -272,13 +273,26 @@ class TrimFront(unittest.TestCase):
         self.assertEqual(len(m["motion"][0]), 49)
         self.assertEqual(m["motion"][0][0], 0)
 
-    def test_never_trims_past_contact(self):
-        m = si.trim_front(self.clip_meta(), 0.9)
-        self.assertEqual(m["idxs"][0], m["impact"])
+    def test_drops_last_20_percent(self):
+        m = si.trim_clip(self.clip_meta(), back=0.2)
+        self.assertEqual(len(m["idxs"]), 49)
+        self.assertEqual(m["idxs"][-1], (200 + 48) % 256)
+        self.assertEqual(m["offset_ms"][-1], 36.0)
+        self.assertEqual(len(m["motion"][0]), 49)
+
+    def test_default_display_trim_both_ends(self):
+        m = si.trim_clip(self.clip_meta(), 0.2, 0.2)
+        self.assertEqual(len(m["idxs"]), 37)              # 18 before, contact, 18 after
+        self.assertEqual(m["idxs"].index(m["impact"]), 18)
+        self.assertEqual((m["offset_ms"][0], m["offset_ms"][-1]), (-36.0, 36.0))
+
+    def test_never_trims_away_contact(self):
+        m = si.trim_clip(self.clip_meta(), 0.9, 0.9)
+        self.assertEqual(m["idxs"], [m["impact"]])
 
     def test_zero_keeps_everything(self):
         meta = self.clip_meta()
-        self.assertIs(si.trim_front(meta, 0), meta)
+        self.assertIs(si.trim_clip(meta, 0, 0), meta)
 
 
 class ShotLoopSelfHealing(unittest.TestCase):

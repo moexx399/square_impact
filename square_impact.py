@@ -461,25 +461,31 @@ def write_sheets(out_dir):
 # The ball and club sit in the left half of the launch camera's view.
 CROPS = {"full": (0.0, 1.0), "left": (0.0, 0.5), "right": (0.5, 1.0)}
 DISPLAY_CROP = "left"  # set from --crop
-# The start of a clip is mostly the club still on its way in; drop this fraction
-# of the frames before showing it (saved clips keep every frame).
+# The start of a clip is mostly the club still on its way in, and the end the
+# ball rolling away; drop these fractions of the frames before showing it
+# (saved clips keep every frame).
 DISPLAY_TRIM_FRONT = 0.2  # set from --trim-front
+DISPLAY_TRIM_BACK = 0.2   # set from --trim-back
 
 
-def trim_front(meta, fraction):
-    """Copy of a clip's meta without its first `fraction` of frames (never past
-    the contact frame). Trims the per-frame lists that go with them."""
+def trim_clip(meta, front=0.0, back=0.0):
+    """Copy of a clip's meta without its first `front` and last `back`
+    fractions of frames (both of the full clip length), never cutting away the
+    contact frame. Trims the per-frame lists that go with them."""
     idxs = meta["idxs"]
-    k = round(len(idxs) * max(0.0, min(fraction, 1.0)))
+    n = len(idxs)
+    lo = round(n * max(0.0, min(front, 1.0)))
+    hi = n - round(n * max(0.0, min(back, 1.0)))
     if meta.get("impact") in idxs:
-        k = min(k, idxs.index(meta["impact"]))
-    if k <= 0:
+        imp = idxs.index(meta["impact"])
+        lo, hi = min(lo, imp), max(hi, imp + 1)
+    if (lo, hi) == (0, n):
         return meta
-    out = dict(meta, idxs=idxs[k:])
+    out = dict(meta, idxs=idxs[lo:hi])
     if "offset_ms" in meta:
-        out["offset_ms"] = meta["offset_ms"][k:]
+        out["offset_ms"] = meta["offset_ms"][lo:hi]
     if "motion" in meta:
-        out["motion"] = [[0] + m[k + 1:] for m in meta["motion"]]
+        out["motion"] = [[0] + m[lo + 1:hi] for m in meta["motion"]]
     return out
 
 
@@ -786,7 +792,7 @@ class Viewer:
         with open(os.path.join(shot_dir, "meta.json")) as fh:
             self.meta = json.load(fh)
         if "impact" in self.meta:  # shot clips only; raw grab/sample captures stay whole
-            self.meta = trim_front(self.meta, DISPLAY_TRIM_FRONT)
+            self.meta = trim_clip(self.meta, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)
         self.dir, self.imgs = shot_dir, {}
         cams = self.meta.get("cams", [0, 1])
         for lbl in self.labels:
@@ -1077,11 +1083,11 @@ class Overlay:
         return True
 
 
-def overlay_payload(out_dir, info="", crop="full", trim=0.0):
+def overlay_payload(out_dir, info="", crop="full", trim=(0.0, 0.0)):
     """(header, bytes) for a saved clip: frames in time order, cams stacked,
-    cropped horizontally (see CROPS) and with the first `trim` of frames dropped."""
+    cropped horizontally (see CROPS) and trimmed by (front, back) fractions."""
     with open(os.path.join(out_dir, "meta.json")) as fh:
-        meta = trim_front(json.load(fh), trim)
+        meta = trim_clip(json.load(fh), *trim)
     w, h, cams = meta["w"], meta["h"], meta.get("cams", [0, 1])
     x0, x1 = crop_columns(w, crop)
     parts = []
@@ -1158,7 +1164,8 @@ def obs(cams, pad, port):
     ov = Overlay()
     serve_overlay(ov, port)
     try:  # last saved shot, so /replay works for positioning before any new shot
-        ov.publish(*overlay_payload(latest_capture(), crop=DISPLAY_CROP, trim=DISPLAY_TRIM_FRONT), announce=False)
+        ov.publish(*overlay_payload(latest_capture(), crop=DISPLAY_CROP,
+                                    trim=(DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)), announce=False)
     except (SystemExit, OSError, ValueError, KeyError):
         pass
     url = f"http://localhost:{port}/"
@@ -1176,7 +1183,8 @@ def obs(cams, pad, port):
             print(a[0], flush=True)
         else:
             out_dir, summary, t_shot, info = a
-            ov.publish(*overlay_payload(out_dir, info, crop=DISPLAY_CROP, trim=DISPLAY_TRIM_FRONT))
+            ov.publish(*overlay_payload(out_dir, info, crop=DISPLAY_CROP,
+                                        trim=(DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)))
             print(f"{summary}; on overlay {time.time() - t_shot:.1f}s after shot", flush=True)
             if info:
                 print(info, flush=True)
@@ -1193,7 +1201,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
@@ -1418,6 +1426,9 @@ def main():
                     help="drop this fraction of each clip's start in the overlay and viewers, "
                          "where the club is still on its way in (default 0.2; 0 shows all; "
                          "saved clips keep every frame)")
+    ap.add_argument("--trim-back", type=float, default=0.2, metavar="FRACTION",
+                    help="drop this fraction of each clip's end in the overlay and viewers, "
+                         "where the ball is rolling away (default 0.2; 0 shows all)")
     ap.add_argument("--crop", choices=list(CROPS), default="left",
                     help="part of the frame shown in the OBS overlay and viewers (default left; "
                          "saved clips keep the full frame)")
@@ -1443,9 +1454,9 @@ def main():
 
 
 def run(a):
-    global ADB, DISPLAY_CROP, DISPLAY_TRIM_FRONT
+    global ADB, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK
     DISPLAY_CROP = a.crop
-    DISPLAY_TRIM_FRONT = a.trim_front
+    DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK = a.trim_front, a.trim_back
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":
