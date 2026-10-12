@@ -110,6 +110,8 @@ common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
   --crop left|right|full  part of the frame shown in the overlay and viewers
                           (default left; saved clips always keep the full frame)
+  --trim-front FRACTION   drop the start of each clip, where the club is still on
+                          its way in (default 0.2 = first 12 of 61 frames; 0 shows all)
   --pad N                 frames kept before and after contact (default 30)
   --no-update-check       skip the check for a newer release (exe only)
 ```
