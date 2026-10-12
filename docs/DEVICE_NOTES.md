@@ -43,7 +43,7 @@ this file when you learn something new.
 
 ## Shot timeline (`r1`)
 
-sqocam logs to logd (`logread`), with uptime stamps `##T <seconds>`. Logged
+sqocam logs through syslog to `/var/log/messages`, with uptime stamps `##T <seconds>`. Logged
 lines for a typical shot, with times relative to the cameras stopping:
 
 | t | Log line | Meaning |
@@ -61,9 +61,17 @@ lines for a typical shot, with times relative to the cameras stopping:
 - **Contact frame:** the moment of impact is 4–5 frames before **F**.
 - **Before the shot:** `ball ready ok.` / `sqp_grab_start(0)` marks the
   switch to 500 fps shot mode once a ball is placed.
-- **Log file vs logd:** `/tmp/log/messages` is rotated (`messages.0`) and
-  flooded by `ledmgr`, so follow logd with `logread -f -e ...` instead of
-  tailing the file.
+- **There is no logd: `logread` is a shell script.** `/sbin/logread` is a
+  "compatibility wrapper" around syslog-ng's file `/var/log/messages`
+  (`/var` → `/tmp`). `logread -f` just runs `tail -f /var/log/messages`, and
+  any `-e` after `-f` is silently ignored.
+- **The log is rotated every ~25 minutes.** `ledmgr` floods it (a few lines a
+  second) and it's rotated to `messages.0` at ~200 KB. BusyBox `tail -f`
+  follows the *open file*, so after a rotation it keeps reading the renamed
+  file and never sees another line. That's what made long sessions stop
+  catching shots. square_impact follows the file by name instead
+  (`FOLLOW_LOG`: restart `tail` when the inode changes, reading the new file
+  from its start).
 - **Frame counter:** the VIN driver status (`/sys/kernel/debug/mpp/vi`, `frame => cnt`)
   keeps counting after the shot line, so it **can't** be used to find the
   newest buffer.

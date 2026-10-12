@@ -45,6 +45,7 @@ Usage:
     python square_impact.py impact [DIR] [--pad N]  # find impact in a full-ring capture
     python square_impact.py view [DIR]            # view a capture (default: newest)
     python square_impact.py version               # version and the adb in use
+    square_impact.exe update [--force]            # replace the exe with the latest GitHub release
 
 Only the newest KEEP_CAPTURES (5) capture folders in shots/ are kept.
 """
@@ -140,12 +141,27 @@ def shell(cmd):
     return out.decode("latin-1").replace("\r", "")
 
 
+# Follow the device log by *name*, surviving rotation. On the Omni, `logread`
+# is only a wrapper script around `tail -f /var/log/messages`, and that file is
+# rotated every ~25 min (ledmgr floods it). BusyBox tail -f keeps reading the
+# renamed old file, so after the first rotation no shot was ever seen again.
+# This restarts tail whenever the file's inode changes, reading the new file
+# from its start so lines written during the switch aren't lost. The only
+# process it ever kills is its own tail.
+FOLLOW_LOG = (
+    "( f=/var/log/messages; n=0; while :; do ino=$(ls -i $f 2>/dev/null); "
+    "tail -n $n -f $f 2>/dev/null & tp=$!; n=+1; "
+    'while [ "$(ls -i $f 2>/dev/null)" = "$ino" ]; do sleep 1; done; '
+    "sleep 1; kill $tp; done )"
+)
+
+
 def shot_trigger(dump):
-    """Wrap `dump` so it runs the moment the next shot is logged. Follows logd
-    via logread (the /tmp/log/messages file gets rotated); sqocam stamps lines
-    with uptime ("##T 2609.890"), so lines from before arming are ignored."""
+    """Wrap `dump` so it runs the moment the next shot is logged. sqocam stamps
+    its lines with uptime ("##T 2609.890"), so lines from before arming are ignored."""
     return ("U=$(cut -d. -f1 /proc/uptime); "
-            f"logread -f -e '{SHOT_LINE}' | while read l; do "
+            f"{FOLLOW_LOG} | while read l; do "
+            f'case "$l" in *"{SHOT_LINE}"*) ;; *) continue;; esac; '
             't=${l##*##T }; t=${t%%.*}; '
             f'if [ "$t" -ge "$U" ] 2>/dev/null; then {dump}; exit; fi; done')
 
@@ -287,7 +303,8 @@ def event_trigger(dump):
     """Like shot_trigger, but also captures sqocam's event buffer into $F from
     the 'sqp_bfind_fire[F, F]' line that precedes 'shot_data return : 1'."""
     return ("U=$(cut -d. -f1 /proc/uptime); F=; "
-            "logread -f -e 'sqp_bfind_fire\\[|" + SHOT_LINE + "' | while read l; do "
+            + FOLLOW_LOG + " | while read l; do "
+            'case "$l" in *"fire["*|*"' + SHOT_LINE + '"*) ;; *) continue;; esac; '
             't=${l##*##T }; t=${t%%.*}; [ "$t" -ge "$U" ] 2>/dev/null || continue; '
             'case "$l" in '
             '*"fire["*) F=${l#*fire[[]}; F=${F%%,*};; '
@@ -333,13 +350,16 @@ class ShotCapture:
         for *_, s in self.parts:
             s.kill()
 
-    def wait_shot(self):
-        """Block until the shot is detected (first marker seen) or a session dies."""
-        while True:
+    def wait_shot(self, timeout=None):
+        """Block until the shot is detected (first marker seen) or a session dies.
+        Returns False if `timeout` seconds pass with neither."""
+        end = None if timeout is None else time.time() + timeout
+        while end is None or time.time() < end:
             for *_, s in self.parts:
                 if s.t_marker or not s.thread.is_alive():
-                    return
+                    return True
             time.sleep(0.01)
+        return False
 
     def result(self):
         """Frames per camera in time order, with their buffer numbers."""
@@ -436,6 +456,24 @@ def write_sheets(out_dir):
 
 
 # ---------------------------------------------------------------- image output
+
+# Horizontal crop for display (OBS overlay, viewers); saved clips stay full-frame.
+# The ball and club sit in the left half of the launch camera's view.
+CROPS = {"full": (0.0, 1.0), "left": (0.0, 0.5), "right": (0.5, 1.0)}
+DISPLAY_CROP = "left"  # set from --crop
+
+
+def crop_columns(w, crop):
+    a, b = CROPS[crop]
+    return int(w * a), int(w * b)
+
+
+def crop_frame(f, w, h, x0, x1):
+    """Keep columns x0..x1 of an 8-bit w*h frame."""
+    if (x0, x1) == (0, w):
+        return f
+    return b"".join(f[y * w + x0:y * w + x1] for y in range(h))
+
 
 def write_pgm(path, w, h, f):
     with open(path, "wb") as fh:
@@ -686,9 +724,10 @@ def status():
 class Viewer:
     """Tk window showing one capture; load() swaps in another (used by live)."""
 
-    def __init__(self, title="Omni frames"):
+    def __init__(self, title="Omni frames", crop=None):
         import tkinter as tk
         self.tk = tk
+        self.crop = crop or DISPLAY_CROP
         self.root = tk.Tk()
         self.root.title(title)
         self.root.configure(bg="#111")
@@ -740,8 +779,14 @@ class Viewer:
     def image(self, cam, idx):
         key = (cam, idx)
         if key not in self.imgs:
-            self.imgs[key] = self.tk.PhotoImage(
-                file=os.path.join(self.dir, f"cam{cam}_{idx:03d}.pgm"))
+            full = self.tk.PhotoImage(file=os.path.join(self.dir, f"cam{cam}_{idx:03d}.pgm"))
+            x0, x1 = crop_columns(full.width(), self.crop)
+            if (x0, x1) == (0, full.width()):
+                self.imgs[key] = full
+            else:
+                img = self.tk.PhotoImage(width=x1 - x0, height=full.height())
+                img.tk.call(img, "copy", full, "-from", x0, 0, x1, full.height())
+                self.imgs[key] = img
         return self.imgs[key]
 
     def show(self, i):
@@ -813,15 +858,40 @@ def shot_once(cams, pad):
     return out_dir
 
 
+REARM_AFTER = 300  # seconds without a shot before the sessions are re-armed
+
+
+def omni_connected():
+    """True if adb sees the Omni right now."""
+    try:
+        out = subprocess.run([ADB, "get-state"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() == "device"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def shot_loop(lay, cams, pad, emit, current):
     """Arm, wait for a shot, fetch, process; repeat until current["stop"].
     Reports through emit(kind, ...): ("status", text) and
-    ("shot", out_dir, summary, t_shot, sqocam_text)."""
+    ("shot", out_dir, summary, t_shot, sqocam_text).
+
+    Self-healing for long sessions: if no shot arrives within REARM_AFTER
+    seconds the sessions are re-armed (clears any silently stalled adb
+    session), and if the Omni disconnects, sleeps or reboots, it waits for it
+    to come back instead of failing."""
     while not current["stop"]:
         try:
+            if not omni_connected():
+                emit("status", "waiting for the Omni (check USB / power)...")
+                while not current["stop"] and not omni_connected():
+                    time.sleep(3)
+                if current["stop"]:
+                    break
             cap = current["cap"] = ShotCapture(lay, cams)
-            emit("status", "armed: hit a shot")
-            cap.wait_shot()
+            emit("status", f"armed: hit a shot  ({time.strftime('%H:%M:%S')})")
+            if not cap.wait_shot(timeout=REARM_AFTER):
+                cap.cancel()  # quiet for a while: re-arm with fresh sessions
+                continue
             if current["stop"]:
                 break
             emit("status", "shot! fetching frames...")
@@ -837,6 +907,8 @@ def shot_loop(lay, cams, pad, emit, current):
         except Exception as e:  # noqa: BLE001 - keep the loop alive, show the error
             if current["stop"]:
                 break
+            if not omni_connected():
+                continue  # lost the Omni mid-capture; the top of the loop waits for it
             traceback.print_exc()
             emit("status", f"error: {e}; re-arming")
             time.sleep(1)
@@ -983,17 +1055,19 @@ class Overlay:
         return True
 
 
-def overlay_payload(out_dir, info=""):
-    """(header, bytes) for a saved clip: frames in time order, cams stacked."""
+def overlay_payload(out_dir, info="", crop="full"):
+    """(header, bytes) for a saved clip: frames in time order, cams stacked,
+    cropped horizontally (see CROPS)."""
     with open(os.path.join(out_dir, "meta.json")) as fh:
         meta = json.load(fh)
     w, h, cams = meta["w"], meta["h"], meta.get("cams", [0, 1])
+    x0, x1 = crop_columns(w, crop)
     parts = []
     for b in meta["idxs"]:
         for cam in cams:
             with open(os.path.join(out_dir, f"cam{cam}_{b:03d}.pgm"), "rb") as fh:
-                parts.append(fh.read()[-w * h:])
-    header = {"w": w, "h": h * len(cams), "n": len(meta["idxs"]),
+                parts.append(crop_frame(fh.read()[-w * h:], w, h, x0, x1))
+    header = {"w": x1 - x0, "h": h * len(cams), "n": len(meta["idxs"]),
               "impact": meta["idxs"].index(meta["impact"]) if meta.get("impact") in meta["idxs"] else 0,
               "info": info, "name": os.path.basename(out_dir)}
     return header, b"".join(parts)
@@ -1062,12 +1136,14 @@ def obs(cams, pad, port):
     ov = Overlay()
     serve_overlay(ov, port)
     try:  # last saved shot, so /replay works for positioning before any new shot
-        ov.publish(*overlay_payload(latest_capture()), announce=False)
+        ov.publish(*overlay_payload(latest_capture(), crop=DISPLAY_CROP), announce=False)
     except (SystemExit, OSError, ValueError, KeyError):
         pass
     url = f"http://localhost:{port}/"
+    crop_w = (lambda x0, x1: x1 - x0)(*crop_columns(lay["w"], DISPLAY_CROP))
     print(f"OBS overlay: add a Browser Source with URL {url}\n"
-          f"  size {lay['w']}x{lay['h'] * len(cams)} (or any size with that aspect ratio)\n"
+          f"  size {crop_w}x{lay['h'] * len(cams)} (or any size with that aspect ratio; "
+          f"--crop {DISPLAY_CROP})\n"
           f"  options: {url}?fps=30&loops=2&gain=1.5&info=1\n"
           f"  re-show the last shot (for positioning): {url}replay\n"
           f"Ctrl+C to stop.", flush=True)
@@ -1078,7 +1154,7 @@ def obs(cams, pad, port):
             print(a[0], flush=True)
         else:
             out_dir, summary, t_shot, info = a
-            ov.publish(*overlay_payload(out_dir, info))
+            ov.publish(*overlay_payload(out_dir, info, crop=DISPLAY_CROP))
             print(f"{summary}; on overlay {time.time() - t_shot:.1f}s after shot", flush=True)
             if info:
                 print(info, flush=True)
@@ -1183,7 +1259,8 @@ def update_notice(release):
         return None
     new, ours = parse_version(release["tag"]), parse_version(VERSION)
     if new and ours and new > ours:
-        return f"Update available: {VERSION} -> {release['tag'].lstrip('v')}   {release['url']}"
+        return (f"Update available: {VERSION} -> {release['tag'].lstrip('v')}   "
+                f"run 'square_impact.exe update' or see {release['url']}")
     return None
 
 
@@ -1203,10 +1280,110 @@ def start_update_check():
     return t
 
 
+# ---------------------------------------------------------------- self-update
+
+RELEASE_ASSET = "square_impact-windows.zip"
+EXE_NAME = "square_impact.exe"
+
+
+def cleanup_old_exe():
+    """Remove the exe left behind by the last `update` (it was still running then)."""
+    if FROZEN:
+        try:
+            os.remove(sys.executable + ".old")
+        except OSError:
+            pass
+
+
+def self_update(force=False):
+    """Replace this exe with the latest GitHub release's.
+
+    Windows can't overwrite a running exe but can rename it, so: download and
+    verify the new one, test-run it, rename the running exe to .old, put the new
+    one in its place (rolling back on any failure). The .old file is removed the
+    next time the program starts."""
+    import hashlib
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    if not FROZEN:
+        sys.exit("running from source: update with `git pull` (self-update is for square_impact.exe)")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": f"square_impact/{VERSION}"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(LATEST_RELEASE_API, headers=headers),
+                                    timeout=15) as resp:
+            release = json.load(resp)
+    except (OSError, ValueError) as e:
+        sys.exit(f"couldn't reach GitHub to check for updates: {e}")
+    tag = release.get("tag_name", "")
+    new, ours = parse_version(tag), parse_version(VERSION)
+    if not new:
+        sys.exit(f"latest release tag {tag!r} isn't a version; not updating")
+    if new <= ours and not force:
+        print(f"already up to date: {VERSION} (latest release {tag})")
+        return
+    asset = next((a for a in release.get("assets", []) if a.get("name") == RELEASE_ASSET), None)
+    if not asset:
+        sys.exit(f"release {tag} has no {RELEASE_ASSET}; download it manually: {RELEASES_PAGE}")
+    url = asset["browser_download_url"]
+    if not url.startswith(f"https://github.com/{REPO}/releases/download/"):
+        sys.exit(f"unexpected download URL {url}; not updating")
+
+    print(f"updating {VERSION} -> {tag.lstrip('v')}")
+    work = tempfile.mkdtemp(prefix="square_impact_update_")
+    try:
+        zpath = os.path.join(work, RELEASE_ASSET)
+        size = asset.get("size") or 0
+        dl = urllib.request.Request(url, headers={"User-Agent": headers["User-Agent"]})
+        with urllib.request.urlopen(dl, timeout=60) as resp, open(zpath, "wb") as out:
+            got = 0
+            while chunk := resp.read(1 << 16):
+                out.write(chunk)
+                got += len(chunk)
+                if size:
+                    print(f"\r  downloading {got / 1e6:5.1f} / {size / 1e6:.1f} MB", end="", flush=True)
+        print()
+        digest = asset.get("digest") or ""  # GitHub publishes "sha256:<hex>" for release assets
+        if digest.startswith("sha256:"):
+            with open(zpath, "rb") as fh:
+                actual = hashlib.sha256(fh.read()).hexdigest()
+            if actual != digest.split(":", 1)[1]:
+                sys.exit("download failed its SHA-256 check; not updating")
+            print("  SHA-256 verified")
+        with zipfile.ZipFile(zpath) as z:
+            name = next((n for n in z.namelist() if n.lower().endswith(EXE_NAME)), None)
+            if not name:
+                sys.exit(f"{RELEASE_ASSET} doesn't contain {EXE_NAME}; not updating")
+            new_exe = os.path.join(work, EXE_NAME)
+            with z.open(name) as src, open(new_exe, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        check = subprocess.run([new_exe, "--help"], capture_output=True, timeout=60)
+        if check.returncode != 0:
+            sys.exit("the downloaded exe failed to start; not updating")
+
+        current = sys.executable
+        old = current + ".old"
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+        os.replace(current, old)          # allowed for a running exe
+        try:
+            shutil.copy2(new_exe, current)
+        except OSError:
+            os.replace(old, current)      # roll back
+            raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"updated to {tag.lstrip('v')}: {current}\n"
+          f"  restart square_impact to use it. Release notes: {release.get('html_url', RELEASES_PAGE)}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
-                                    "impact", "version"])
+                                    "impact", "version", "update"])
     ap.add_argument("arg", nargs="?", help="sample: step N; view/impact: capture dir")
     ap.add_argument("--shot", action="store_true", help="sample/grab: wait for the next shot")
     ap.add_argument("--range", metavar="A:B", help="sample: only buffers A..B-1 (e.g. 120:150)")
@@ -1215,13 +1392,21 @@ def main():
                          "default top for live/shot, both otherwise")
     ap.add_argument("--pad", type=int, default=30, help="frames kept before/after impact (30)")
     ap.add_argument("--port", type=int, default=8765, help="obs: overlay web server port (8765)")
+    ap.add_argument("--crop", choices=list(CROPS), default="left",
+                    help="part of the frame shown in the OBS overlay and viewers (default left; "
+                         "saved clips keep the full frame)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
     ap.add_argument("--no-update-check", action="store_true",
                     help="don't check GitHub for a newer release (exe only; also "
                          "SQUARE_IMPACT_NO_UPDATE_CHECK=1)")
+    ap.add_argument("--force", action="store_true",
+                    help="update: reinstall the latest release even if not newer")
     a = ap.parse_args()
+    cleanup_old_exe()
     if a.cmd == "version":
         return version_info()
+    if a.cmd == "update":
+        return self_update(a.force)
     banner(a.cmd)
     upd = start_update_check() if update_check_enabled(a.no_update_check) else None
     try:
@@ -1232,7 +1417,8 @@ def main():
 
 
 def run(a):
-    global ADB
+    global ADB, DISPLAY_CROP
+    DISPLAY_CROP = a.crop
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":

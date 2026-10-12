@@ -55,8 +55,10 @@ and `adb` (`winget install Google.PlatformTools`).
    python square_impact.py obs
    ```
    In OBS add a **Browser Source** with URL `http://localhost:8765/` and size
-   **1280×192** (or any 20:3 size). Open `http://localhost:8765/replay` in any
-   browser to re-show the last shot while you position it.
+   **640×192** (or any 10:3 size). By default only the left half of the camera
+   view is shown, where the ball and club are (see `--crop`). Open
+   `http://localhost:8765/replay` in any browser to re-show the last shot while
+   you position it.
 
    **Desktop viewer.** Stays open and loads every new shot:
    ```bash
@@ -67,6 +69,11 @@ and `adb` (`winget install Google.PlatformTools`).
 
 Run only one capture at a time (`obs`, `live`, `shot`, ...). Two compete for
 the same USB bandwidth and can miss the window before the cameras restart.
+
+`obs` and `live` are meant to stay running for a whole session. They re-arm on
+their own every 5 minutes without a shot, and if the Omni sleeps, reboots, or
+the USB cable is unplugged they show *waiting for the Omni* and pick up again
+once it's back.
 
 ## OBS overlay options
 
@@ -97,9 +104,12 @@ python square_impact.py grab  [--shot]             every buffer in the ring (slo
 python square_impact.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
 python square_impact.py impact [DIR]               find impact in a full-ring capture
 python square_impact.py version                    version, update check, and the adb in use
+square_impact.exe update [--force]                 replace the exe with the latest release
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
+  --crop left|right|full  part of the frame shown in the overlay and viewers
+                          (default left; saved clips always keep the full frame)
   --pad N                 frames kept before and after contact (default 30)
   --no-update-check       skip the check for a newer release (exe only)
 ```
@@ -107,21 +117,33 @@ common options:
 Viewer keys: `←`/`→` step a frame, `Space` play/pause. Buttons jump to impact
 and save the current frame as PNG.
 
-### Update check
+### Updates
 
 When it starts, **the exe** checks GitHub for a newer release in the background
 and, if there is one, prints a line under the banner:
 
 ```text
-  ⬆ Update available: 0.1.0 -> 0.2.0   https://github.com/moexx399/square_impact/releases/tag/v0.2.0
+  ⬆ Update available: 0.2.0 -> 0.3.0   run 'square_impact.exe update' or see https://github.com/...
 ```
 
-It never delays startup or downloads anything; updating is up to you. It asks
-GitHub at most once a day (cached in `%LOCALAPPDATA%\square_impact\update_check.json`)
-and stays silent if you're offline. The request goes to `api.github.com` and
-contains only the app name and version. To turn it off, use `--no-update-check`
-or set `SQUARE_IMPACT_NO_UPDATE_CHECK=1`. Running from source doesn't check
-(use `git pull`), but `version` always does a fresh check.
+The check never delays startup. It asks GitHub at most once a day (cached in
+`%LOCALAPPDATA%\square_impact\update_check.json`) and stays silent if you're
+offline. The request goes to `api.github.com` and contains only the app name and
+version. To turn it off, use `--no-update-check` or set
+`SQUARE_IMPACT_NO_UPDATE_CHECK=1`. Running from source doesn't check (use
+`git pull`), but `version` always does a fresh check.
+
+To install an update, close square_impact and run:
+
+```bash
+square_impact.exe update
+```
+
+It downloads `square_impact-windows.zip` from the latest GitHub release,
+verifies its SHA-256 against the digest GitHub publishes, test-runs the new exe,
+then swaps it in. The old exe is kept as `square_impact.exe.old` until the next
+start, and the swap rolls back if anything fails. `--force` reinstalls the
+latest release even if you already have it.
 
 ## Output
 
@@ -162,8 +184,9 @@ calibration in `/tmp/sqocam.cfg`.
   square_impact reads physical memory with `dd if=/dev/mem`.
 - **A shot has ~5 s before it's gone.** After a shot, sqocam stops the
   cameras, analyses the shot, then restarts them about 5 s later, overwriting
-  the ring. square_impact watches the log *on the device* (`logread -f`). The
-  moment `sqp_bfind_shot_data return : 1` appears, it reads the event frame
+  the ring. square_impact watches the log *on the device*, following
+  `/var/log/messages` across its rotations. The moment
+  `sqp_bfind_shot_data return : 1` appears, it reads the event frame
   from the preceding `sqp_bfind_fire[F, F]` line and copies just the 71
   frames around it into `dd`'s memory. That takes a fraction of a second.
   Streaming them to the PC can then take as long as it needs.
@@ -185,9 +208,11 @@ calibration in `/tmp/sqocam.cfg`.
 ### Read-only by design
 
 Every command sent to the Omni only reads: `/dev/mem`, `/tmp/sqocam.cfg` and
-`logread`. Nothing is pushed, written, staged in `/tmp`, or reconfigured. The
-only setting touched is `stty -opost` on square_impact's own adb session terminal,
-which disappears when that session closes.
+`/var/log/messages`. Nothing is pushed, written, staged in `/tmp`, or
+reconfigured. The only process it ever stops is the `tail` it started itself
+(to follow the log across rotations), and the only setting touched is
+`stty -opost` on square_impact's own adb session terminal, which disappears
+when that session closes.
 
 ## Performance
 

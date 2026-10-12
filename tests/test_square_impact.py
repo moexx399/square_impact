@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zlib
 
@@ -109,8 +111,11 @@ class DeviceCommandsAreReadOnly(unittest.TestCase):
     WRITE_PATTERNS = [
         r"(?<!2)>(?!\s*/dev/null)",  # output redirection other than 2>/dev/null
         r"\b(rm|mv|cp|dd\s+of=|touch|mkdir|tee|mount|umount|setprop|insmod|rmmod|reboot|"
-        r"kill|pkill|killall|chmod|chown|ln|truncate|fw_setenv|uci|sysupgrade)\b",
+        r"pkill|killall|chmod|chown|ln|truncate|fw_setenv|uci|sysupgrade)\b",
         r"\bof=",
+        # the log follower may only kill its own tail ($tp = the PID of the
+        # `tail` it started with &), never any other process
+        r"\bkill\b(?!\s+\$tp\b)",
     ]
 
     def commands(self):
@@ -144,9 +149,51 @@ class DeviceCommandsAreReadOnly(unittest.TestCase):
         ]
         cmd = si.event_trigger("echo EVENT=$F").replace(
             "U=$(cut -d. -f1 /proc/uptime)", "U=1000").replace(
-            f"logread -f -e 'sqp_bfind_fire\\[|{si.SHOT_LINE}'", "printf '%s\\n' \"$@\"")
+            si.FOLLOW_LOG, "printf '%s\\n' \"$@\"")
         out = subprocess.run(["sh", "-c", cmd, "sh", *lines], capture_output=True, text=True)
         self.assertEqual(out.stdout.strip(), "EVENT=34", out.stderr)
+
+    @unittest.skipUnless(os.name == "posix" and all(shutil.which(t) for t in ("sh", "tail", "ls")),
+                         "needs a POSIX sh/tail/ls (MSYS on Windows can't clean up the tail)")
+    def test_log_follower_survives_rotation(self):
+        """The Omni rotates /var/log/messages every ~25 min. A plain `tail -f`
+        stays on the renamed file and never sees another shot (the 'hang')."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = os.path.join(tmp, "messages").replace("\\", "/")
+        with open(log, "w") as fh:
+            fh.write("old line before arming\n")
+        follow = si.FOLLOW_LOG.replace("/var/log/messages", log)
+        p = subprocess.Popen(["sh", "-c", follow], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, start_new_session=True)
+
+        def kill_tree():  # sh, its subshell and its tail
+            import signal
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+        self.addCleanup(kill_tree)
+        lines = []
+        threading.Thread(target=lambda: [lines.append(x.strip()) for x in p.stdout],
+                         daemon=True).start()
+
+        def wait_for(text, secs=8):
+            end = time.time() + secs
+            while time.time() < end and text not in lines:
+                time.sleep(0.1)
+            return text in lines
+
+        time.sleep(1.5)
+        with open(log, "a") as fh:
+            fh.write("before rotation\n")
+        self.assertTrue(wait_for("before rotation"))
+        os.replace(log, log + ".0")                 # rotate like logrotate does
+        with open(log, "w") as fh:
+            fh.write("written right after rotation\n")
+        self.assertTrue(wait_for("written right after rotation"), lines)
+        with open(log, "a") as fh:
+            fh.write("later line\n")
+        self.assertTrue(wait_for("later line"), lines)
+        self.assertNotIn("old line before arming", lines)
 
 
 class Files(unittest.TestCase):
@@ -192,6 +239,61 @@ class Files(unittest.TestCase):
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
         idat = png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8]
         self.assertEqual(zlib.decompress(idat), b"\x00\x00\x01\x02\x00\x03\x04\x05")
+
+
+class Crop(unittest.TestCase):
+    def test_left_half(self):
+        w, h = 6, 2
+        f = bytes(range(12))
+        x0, x1 = si.crop_columns(w, "left")
+        self.assertEqual((x0, x1), (0, 3))
+        self.assertEqual(si.crop_frame(f, w, h, x0, x1), bytes([0, 1, 2, 6, 7, 8]))
+        self.assertEqual(si.crop_frame(f, w, h, *si.crop_columns(w, "right")), bytes([3, 4, 5, 9, 10, 11]))
+        self.assertIs(si.crop_frame(f, w, h, *si.crop_columns(w, "full")), f)
+
+
+class ShotLoopSelfHealing(unittest.TestCase):
+    """The capture loop must never wait forever: it re-arms when quiet, and
+    waits for the Omni to come back if it disconnects."""
+
+    def run_loop(self, captures, connected):
+        from unittest import mock
+        made, statuses = [], []
+        current = {"cap": None, "stop": False}
+
+        class FakeCapture:
+            def __init__(self, lay, cams):
+                made.append(self)
+                self.behaviour = captures[len(made) - 1]
+
+            def wait_shot(self, timeout=None):
+                if self.behaviour == "stop":
+                    current["stop"] = True
+                return False   # nothing happened within the timeout
+
+            def cancel(self):
+                pass
+
+        def emit(kind, *a):
+            statuses.append(a[0] if kind == "status" else kind)
+
+        with mock.patch.object(si, "ShotCapture", FakeCapture), \
+                mock.patch.object(si, "omni_connected", side_effect=connected), \
+                mock.patch.object(si.time, "sleep"):
+            si.shot_loop({}, [0], 30, emit, current)
+        return made, statuses
+
+    def test_rearms_after_a_quiet_period(self):
+        made, statuses = self.run_loop(["quiet", "quiet", "stop"], connected=lambda: True)
+        self.assertEqual(len(made), 3)                  # re-armed twice, no hang
+        self.assertTrue(all(s.startswith("armed") for s in statuses))
+
+    def test_waits_for_the_omni_to_come_back(self):
+        state = iter([False, False, False, True, True, True])
+        made, statuses = self.run_loop(["stop"], connected=lambda: next(state))
+        self.assertIn("waiting for the Omni", statuses[0])
+        self.assertTrue(statuses[1].startswith("armed"))
+        self.assertEqual(len(made), 1)
 
 
 class UpdateCheck(unittest.TestCase):

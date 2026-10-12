@@ -1,0 +1,3 @@
+kind: Added
+body: '`obs` and `live` re-arm every 5 minutes without a shot and wait for the Omni to reconnect if it sleeps, reboots or is unplugged'
+time: 2026-10-11T19:44:45.5150929-05:00

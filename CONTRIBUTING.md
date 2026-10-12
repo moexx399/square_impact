@@ -9,10 +9,11 @@ fixes, and features are all welcome. By taking part you agree to follow the
 These two rules aren't negotiable. Pull requests that break them can't be merged.
 
 1. **Never write to the Omni.** square_impact only *reads* from the device:
-   `/dev/mem`, `/tmp/sqocam.cfg` and `logread`. No `adb push`, no files in `/tmp`,
-   no redirects (`>`), no `rm`/`mv`/`mount`/`setprop`, no killing or restarting
-   sqocam, no config changes. The one exception is `stty -opost` on our own
-   temporary adb session terminal. `tests/test_square_impact.py` has a guard test
+   `/dev/mem`, `/tmp/sqocam.cfg` and `/var/log/messages`. No `adb push`, no files
+   in `/tmp`, no redirects (`>`), no `rm`/`mv`/`mount`/`setprop`, no killing or
+   restarting sqocam, no config changes. The only exceptions are `stty -opost` on
+   our own temporary adb session terminal, and the log follower stopping the
+   `tail` it started itself (`kill $tp`). `tests/test_square_impact.py` has a guard test
    for the generated device commands. If you add a new device command, add it
    to that test.
 2. **Standard library only.** Users run it with a bare Python or the exe, so

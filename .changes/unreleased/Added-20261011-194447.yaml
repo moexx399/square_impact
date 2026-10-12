@@ -1,0 +1,3 @@
+kind: Added
+body: '`square_impact.exe update` downloads the latest release from GitHub, verifies its SHA-256, and replaces the exe'
+time: 2026-10-11T19:44:47.8086794-05:00

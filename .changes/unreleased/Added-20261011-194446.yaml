@@ -1,0 +1,3 @@
+kind: Added
+body: '`--crop left|right|full` for the OBS overlay and viewers; defaults to the left half (640x192), where the ball and club are. Saved clips keep the full frame'
+time: 2026-10-11T19:44:46.6704862-05:00
