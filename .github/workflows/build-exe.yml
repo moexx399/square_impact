@@ -49,9 +49,13 @@ jobs:
           # adb.exe needs its two DLLs beside it; NOTICE.txt carries the licenses
           Copy-Item platform-tools/adb.exe, platform-tools/AdbWinApi.dll, platform-tools/AdbWinUsbApi.dll, platform-tools/NOTICE.txt adb/
 
+      - name: Draw the icon
+        # the logo is drawn by square_impact.py itself, so there's no image file to keep in sync
+        run: python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"
+
       - name: Build exe
         shell: pwsh
-        run: pyinstaller --onefile --console --name square_impact --add-data "adb;adb" square_impact.py
+        run: pyinstaller --onefile --console --name square_impact --icon square_impact.ico --add-data "adb;adb" square_impact.py
 
       - name: Smoke test (runs the bundled adb, no device needed)
         shell: pwsh

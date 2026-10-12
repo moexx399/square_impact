@@ -1,3 +1,5 @@
+<img src="docs/logo.png" alt="square_impact logo" width="96" align="right">
+
 # square_impact
 
 [![ci](https://github.com/moexx399/square_impact/actions/workflows/ci.yml/badge.svg)](https://github.com/moexx399/square_impact/actions/workflows/ci.yml)
@@ -298,7 +300,8 @@ reading it.
 
 1. downloads Google's latest Android SDK platform-tools and takes `adb.exe`,
    `AdbWinApi.dll`, `AdbWinUsbApi.dll` and `NOTICE.txt`;
-2. builds a one-file `square_impact.exe` with PyInstaller, bundling those files;
+2. draws the icon (`square_impact.ico`, from `logo_ico()` in the script) and
+   builds a one-file `square_impact.exe` with PyInstaller, bundling those files;
 3. smoke-tests it with `square_impact.exe version`, which runs the bundled adb
    and needs no device;
 4. uploads `square_impact-windows.zip` (exe, README, LICENSE, adb license notice) as a
@@ -310,7 +313,8 @@ To build locally, do the same by hand:
 ```bash
 pip install pyinstaller
 mkdir adb   # then copy adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll, NOTICE.txt from platform-tools into it
-pyinstaller --onefile --console --name square_impact --add-data "adb;adb" square_impact.py
+python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"
+pyinstaller --onefile --console --name square_impact --icon square_impact.ico --add-data "adb;adb" square_impact.py
 ```
 
 adb is part of the Android SDK platform-tools (Apache 2.0). Its license notice

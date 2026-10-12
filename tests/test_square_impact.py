@@ -10,6 +10,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -626,6 +627,49 @@ class UpdateCheck(unittest.TestCase):
             self.assertFalse(si.update_check_enabled(opt_out=True))
             os.environ["SQUARE_IMPACT_NO_UPDATE_CHECK"] = "1"
             self.assertFalse(si.update_check_enabled(opt_out=False))
+
+
+class Logo(unittest.TestCase):
+    def test_icon_is_a_rounded_square(self):
+        px = si.logo_rgba(32)
+        alpha = lambda x, y: px[(y * 32 + x) * 4 + 3]
+        self.assertEqual(len(px), 32 * 32 * 4)
+        self.assertEqual(alpha(0, 0), 0)        # rounded corner is transparent
+        self.assertEqual(alpha(16, 16), 255)    # body is opaque
+        self.assertEqual(alpha(16, 0), 255)
+
+    def test_png_decodes(self):
+        png = si.logo_png(16)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(png[12:16], b"IHDR")
+        self.assertEqual(png[16:26], bytes([0, 0, 0, 16, 0, 0, 0, 16, 8, 6]))  # 16x16 RGBA
+        idat = png.index(b"IDAT")
+        n = int.from_bytes(png[idat - 4:idat], "big")
+        raw = zlib.decompress(png[idat + 4:idat + 4 + n])
+        self.assertEqual(len(raw), 16 * (1 + 16 * 4))
+
+    def test_ico_lists_every_size(self):
+        ico = si.logo_ico()
+        self.assertEqual(ico[:6], bytes([0, 0, 1, 0, len(si.ICON_SIZES), 0]))
+        for k, size in enumerate(si.ICON_SIZES):
+            w, _, _, _, _, bpp, n, off = struct.unpack_from("<BBBBHHII", ico, 6 + 16 * k)
+            self.assertEqual(w, size % 256)     # 0 means 256
+            self.assertEqual(bpp, 32)
+            self.assertEqual(ico[off:off + n], si.logo_png(size))
+
+    def test_overlay_serves_favicon(self):
+        import urllib.request
+        srv = si.serve_overlay(si.Overlay(), 0)   # port 0: any free port
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            with urllib.request.urlopen(base + "/") as r:
+                self.assertIn(b'rel="icon"', r.read())
+            with urllib.request.urlopen(base + "/favicon.png") as r:
+                self.assertEqual(r.headers["Content-Type"], "image/png")
+                self.assertEqual(r.read(), si.logo_png(32))
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

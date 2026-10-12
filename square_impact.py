@@ -52,8 +52,10 @@ Only the newest KEEP_CAPTURES (5) capture folders in shots/ are kept.
 
 import argparse
 import collections
+import functools
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -894,13 +896,19 @@ def write_pgm(path, w, h, f):
         fh.write(b"P5\n%d %d\n255\n" % (w, h) + f)
 
 
-def write_png(path, w, h, px):
-    """Minimal 8-bit grayscale PNG writer (stdlib only)."""
-    raw = b"".join(b"\x00" + px[y * w:(y + 1) * w] for y in range(h))
+def png_bytes(w, h, px, channels=1):
+    """Minimal 8-bit PNG encoder (stdlib only): grayscale, RGB or RGBA."""
+    row = w * channels
+    raw = b"".join(b"\x00" + px[y * row:(y + 1) * row] for y in range(h))
     chunk = lambda t, b: struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+    ctype = {1: 0, 3: 2, 4: 6}[channels]
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def write_png(path, w, h, px):
     with open(path, "wb") as fh:
-        fh.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
-                 + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+        fh.write(png_bytes(w, h, px))
 
 
 def half(f, w, h):
@@ -1239,6 +1247,97 @@ def display_segments(shot_dir):
     return out
 
 
+# ---------------------------------------------------------------- logo
+
+def logo_rgba(size):
+    """The app icon as RGBA pixels, drawn from code so there's no image file to
+    ship: a golf ball and two fading strobe exposures inside orange camera
+    viewfinder corners, on a dark rounded square. Edges are antialiased from
+    signed distances, so every size is drawn natively rather than scaled."""
+    def box(x, y, cx, cy, hw, hh, r=0.0):
+        qx, qy = abs(x - cx) - hw + r, abs(y - cy) - hh + r
+        return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - r
+
+    def cover(d):  # distance (in icon widths) -> pixel coverage
+        return min(1.0, max(0.0, 0.5 - d * size))
+
+    def over(c, col, k):  # paint colour col over pixel c with coverage k
+        for n in range(3):
+            c[n] += (col[n] - c[n]) * k
+
+    m, arm, t = 0.15, 0.17, 0.05      # viewfinder margin, arm length, thickness
+    corners = []
+    for ex, dx in ((m, 1), (1 - m, -1)):
+        for ey, dy in ((m, 1), (1 - m, -1)):
+            corners += [(ex + dx * arm / 2, ey + dy * t / 2, arm / 2, t / 2),
+                        (ex + dx * t / 2, ey + dy * arm / 2, t / 2, arm / 2)]
+    by, br, bx = 0.5, 0.19, 0.62      # ball centre y, radius, centre x
+    ghosts = [(0.30, 0.22), (0.45, 0.45)]   # earlier exposures: x, opacity
+    dimples = [(bx + 0.075 * i, by + 0.075 * j) for i, j in
+               [(-1, -1), (0, -1.15), (1, -1), (-1.15, 0), (0, 0), (1.15, 0), (-1, 1), (0, 1.15), (1, 1)]]
+    out = bytearray()
+    for j in range(size):
+        y = (j + 0.5) / size
+        for i in range(size):
+            x = (i + 0.5) / size
+            alpha = cover(box(x, y, 0.5, 0.5, 0.5, 0.5, 0.22))
+            if not alpha:
+                out += b"\0\0\0\0"
+                continue
+            c = [0x16 + (0x0a - 0x16) * y, 0x2c + (0x14 - 0x2c) * y, 0x48 + (0x24 - 0x48) * y]
+            over(c, (0xff, 0x8a, 0x1f), cover(min(box(x, y, *b) for b in corners)))
+            for gx, opacity in ghosts:
+                over(c, (0xbf, 0xd4, 0xea), cover(math.hypot(x - gx, y - by) - br) * opacity)
+            k = cover(math.hypot(x - bx, y - by) - br)
+            if k:
+                shade = min(1.0, math.hypot(x - bx + 0.07, y - by + 0.07) / (br * 1.6))
+                over(c, [255 + (v - 255) * shade for v in (0xb4, 0xc0, 0xcf)], k)
+                if size >= 48:  # just noise at small sizes
+                    for dx, dy in dimples:
+                        over(c, (0x9a, 0xa8, 0xb8), cover(math.hypot(x - dx, y - dy) - 0.022) * 0.55)
+            out += bytes(round(v) for v in c) + bytes([round(255 * alpha)])
+    return bytes(out)
+
+
+@functools.cache
+def logo_png(size):
+    return png_bytes(size, size, logo_rgba(size), 4)
+
+
+ICON_SIZES = (16, 24, 32, 48, 64, 256)
+
+
+def logo_ico(sizes=ICON_SIZES):
+    """Windows .ico with a PNG image per size (the exe's icon, built in CI)."""
+    pngs = [logo_png(s) for s in sizes]
+    head = struct.pack("<HHH", 0, 1, len(pngs))
+    offset = len(head) + 16 * len(pngs)
+    entries = b""
+    for s, png in zip(sizes, pngs):
+        entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(png), offset)
+        offset += len(png)
+    return head + entries + b"".join(pngs)
+
+
+def set_app_id():
+    """Without its own app ID, Windows groups our windows under python.exe and
+    shows Python's icon in the taskbar. Must run before the first window is
+    created. The ID only lives in this process; nothing is registered."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("square_impact")
+        except (AttributeError, OSError):
+            pass
+
+
+def set_window_icon(root):
+    """Title bar, Alt+Tab and taskbar icon for a Tk window."""
+    import tkinter as tk
+    root._icons = [tk.PhotoImage(data=logo_png(s), format="PNG") for s in (64, 48, 32, 16)]
+    root.iconphoto(True, *root._icons)
+
+
 # ---------------------------------------------------------------- viewer
 
 class Viewer:
@@ -1248,8 +1347,10 @@ class Viewer:
     def __init__(self, title="Omni frames"):
         import tkinter as tk
         self.tk = tk
+        set_app_id()
         self.root = tk.Tk()
         self.root.title(title)
+        set_window_icon(self.root)
         self.root.configure(bg="#111")
         self.segs, self.play, self.dir, self.imgs = [], [], None, {}
         self.state = {"i": 0, "play": False}
@@ -1570,6 +1671,7 @@ def live(cams, pad):
 
 OVERLAY_PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Omni shot overlay</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
   html, body { margin: 0; background: transparent; overflow: hidden; }
   #wrap { position: relative; opacity: 0; transform: translateY(12px);
@@ -1711,6 +1813,8 @@ def serve_overlay(ov, port):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 return self.send(200, "text/html; charset=utf-8", OVERLAY_PAGE.encode())
+            if path in ("/favicon.png", "/favicon.ico"):
+                return self.send(200, "image/png", logo_png(32))
             if path == "/impact.png":   # still of the latest shot's moment of impact
                 snap = ov.shot_dir and os.path.join(ov.shot_dir, "impact.png")
                 if not snap or not os.path.exists(snap):
@@ -1797,7 +1901,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

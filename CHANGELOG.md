@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.8.0 - 2026-10-12
+### Added
+* App logo: shown on the viewer window, in the taskbar and Alt+Tab, as the OBS overlay page's favicon, and as the exe's icon
+
 ## v0.7.0 - 2026-10-12
 ### Added
 * Spin camera support: with the spin board (r2) USB port connected, each shot shows a sharp, strobe-lit close-up of the ball leaving the club
