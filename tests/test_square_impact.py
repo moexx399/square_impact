@@ -124,6 +124,10 @@ class DeviceCommandsAreReadOnly(unittest.TestCase):
         yield si.session_cmd(lay, 1, 40, 31, trigger=False, f_fixed=250)
         yield si.shot_trigger("echo x")
         yield si.event_trigger("echo x")
+        r2 = {"nbuf": 128, "stride": 0x80000, "w": 1280, "h": 384}
+        yield si.snapshot_cmd(r2, 0, 10, 16)
+        yield si.snapshot_cmd(r2, 1, 120, 20)          # wraps past the end of the ring
+        yield si.log_trigger(si.SFIND_LINE, "echo x")
 
     def test_no_writes(self):
         for cmd in self.commands():
@@ -213,28 +217,51 @@ class Files(unittest.TestCase):
         si.prune_captures(keep=5)
         self.assertEqual(sorted(os.listdir(self.tmp)), names[-5:])
 
-    def test_overlay_payload_orders_frames_and_stacks_cams(self):
-        d = os.path.join(self.tmp, "20261011_140000_r1_shot_cam01")
+    def test_save_load_display_payload(self):
+        """A two-board shot saves, reloads, and plays as r1 (trimmed, cropped,
+        both cams stacked) then r2 (whole frame)."""
+        from unittest import mock
+        w, h = 4, 2
+        r1 = {"board": "r1", "cams": [0, 1], "w": w, "h": h, "fps": 500.0,
+              "idxs": [254, 255, 0, 1], "impact": 0,
+              "offset_ms": [-4.0, -2.0, 0.0, 2.0],
+              "frames": {0: [bytes([b]) * (w * h) for b in (254, 255, 0, 1)],
+                         1: [bytes([200]) * (w * h)] * 4}}
+        r2 = {"board": "r2", "cams": [0], "w": w, "h": h, "fps": 250.0,
+              "idxs": [10, 11, 12], "impact": 11, "offset_ms": [-4.0, 0.0, 4.0],
+              "frames": {0: [bytes(range(8)), bytes(range(8, 16)), bytes(range(16, 24))]}}
+        with mock.patch.object(si, "DISPLAY_DENOISE", False), \
+                mock.patch.object(si, "DISPLAY_CROP", "left"), \
+                mock.patch.object(si, "DISPLAY_TRIM_FRONT", 0.25), \
+                mock.patch.object(si, "DISPLAY_TRIM_BACK", 0.25):
+            d = si.save_shot([r1, r2], "info")
+            self.assertTrue(os.path.basename(d).endswith("_shot_r1+r2"))
+            loaded = si.load_shot(d)
+            self.assertEqual([s["board"] for s in loaded], ["r1", "r2"])
+            self.assertEqual(loaded[0]["frames"][0][0], r1["frames"][0][0])
+            header, data = si.overlay_payload(d, "info")
+        g1, g2 = header["segments"]
+        # r1: a quarter trimmed off each end -> buffers 255, 0; left half; cams stacked
+        self.assertEqual((g1["w"], g1["h"], g1["n"], g1["impact"]), (2, 4, 2, 1))
+        # r2: untouched
+        self.assertEqual((g2["w"], g2["h"], g2["n"]), (4, 2, 3))
+        r1_bytes = 2 * (2 * 4)
+        self.assertEqual(len(data), r1_bytes + 3 * w * h)
+        self.assertEqual(data[0], 255)                 # first r1 frame = buffer 255, cam0
+        self.assertEqual(data[2 * h], 200)             # then cam1 below it
+        self.assertEqual(data[r1_bytes:r1_bytes + 8], bytes(range(8)))
+
+    def test_loads_older_single_board_folders(self):
+        d = os.path.join(self.tmp, "20261011_140000_r1_shot_cam0")
         os.makedirs(d)
-        w, h, idxs = 4, 2, [254, 255, 0, 1]   # wraps around the ring
-        for b in idxs:
-            for cam in (0, 1):
-                si.write_pgm(os.path.join(d, f"cam{cam}_{b:03d}.pgm"), w, h,
-                             bytes([b % 256 if cam == 0 else 200]) * (w * h))
+        w, h = 4, 2
+        for b in (5, 6):
+            si.write_pgm(os.path.join(d, f"cam0_{b:03d}.pgm"), w, h, bytes([b]) * (w * h))
         with open(os.path.join(d, "meta.json"), "w") as fh:
-            json.dump({"w": w, "h": h, "idxs": idxs, "cams": [0, 1], "impact": 0}, fh)
-        header, data = si.overlay_payload(d, "info")
-        self.assertEqual((header["w"], header["h"], header["n"], header["impact"]), (4, 4, 4, 2))
-        self.assertEqual(len(data), 4 * w * h * 2)
-        # frame k = cam0 then cam1
-        self.assertEqual(data[0], 254)
-        self.assertEqual(data[w * h], 200)
-        self.assertEqual(data[2 * w * h], 255)
-        # trimming a quarter off each end drops buffers 254 and 1
-        header, data = si.overlay_payload(d, "info", trim=(0.25, 0.25))
-        self.assertEqual((header["n"], header["impact"]), (2, 1))
-        self.assertEqual(len(data), 2 * w * h * 2)
-        self.assertEqual(data[0], 255)
+            json.dump({"board": "r1", "w": w, "h": h, "idxs": [5, 6], "cams": [0], "impact": 6,
+                       "offset_ms": [-2.0, 0.0], "fps": 500.0}, fh)
+        (seg,) = si.load_shot(d)
+        self.assertEqual((seg["board"], seg["impact"], seg["frames"][0][1][0]), ("r1", 6, 6))
 
     def test_png_writer(self):
         path = os.path.join(self.tmp, "t.png")
@@ -255,6 +282,50 @@ class Crop(unittest.TestCase):
         self.assertEqual(si.crop_frame(f, w, h, x0, x1), bytes([0, 1, 2, 6, 7, 8]))
         self.assertEqual(si.crop_frame(f, w, h, *si.crop_columns(w, "right")), bytes([3, 4, 5, 9, 10, 11]))
         self.assertIs(si.crop_frame(f, w, h, *si.crop_columns(w, "full")), f)
+
+
+class BallCrop(unittest.TestCase):
+    def test_window_is_centred_and_padded_past_the_edges(self):
+        f = bytes(range(12))                                     # 6x2 frame
+        self.assertEqual(si.crop_window(f, 6, 2, 3, 1, 4, 2), bytes([1, 2, 3, 4, 7, 8, 9, 10]))
+        self.assertEqual(si.crop_window(f, 6, 2, 0, 1, 4, 2), bytes([0, 0, 0, 1, 0, 0, 6, 7]))
+        self.assertEqual(si.crop_window(f, 6, 2, 6, 1, 4, 2), bytes([4, 5, 0, 0, 10, 11, 0, 0]))
+        self.assertEqual(si.crop_window(f, 6, 2, -50, 1, 4, 2), bytes(8))
+
+    def scene(self, ball=None, stripe=False, shaft=False):
+        """Bright floor (like the grey-carpet room) with optional ball, a long flat
+        floor highlight, and a tall thin club shaft."""
+        f = bytearray(frame(0, ball=None))
+        if stripe:   # long, flat and bigger than the ball
+            for y in range(70, 76):
+                for x in range(600, 900):
+                    f[y * W + x] = 250
+        if shaft:    # tall and thin
+            for y in range(10, 150):
+                for x in range(300, 306):
+                    f[y * W + x] = 250
+        if ball:
+            f = bytearray(frame(0, ball=ball, brightness=250))
+            if stripe or shaft:
+                g = self.scene(None, stripe, shaft)
+                f = bytearray(max(a, b) for a, b in zip(f, g))
+        return bytes(f)
+
+    def test_finds_the_ball_not_the_floor_stripe_or_shaft(self):
+        x, y = si.ball_blob(self.scene(ball=(195, 134), stripe=True, shaft=True), W, H)
+        self.assertLess(abs(x - 195), 4)
+        self.assertLess(abs(y - 134), 4)
+        self.assertIsNone(si.ball_blob(self.scene(stripe=True, shaft=True), W, H))
+
+    def test_path_fills_frames_without_a_ball(self):
+        frames = [frame(0, ball=None), frame(1, ball=(400, 120)), frame(2, ball=None),
+                  frame(3, ball=(500, 120)), frame(0, ball=None)]
+        xs = [round(p[0]) for p in si.ball_path(frames, W, H)]
+        # held before the first sighting, interpolated between, held after the
+        # last (not panned off into black); then lightly smoothed
+        self.assertTrue(xs[0] <= xs[1] <= xs[2] <= xs[3] <= xs[4], xs)
+        for got, want in zip((xs[0], xs[2], xs[4]), (400, 450, 500)):
+            self.assertLessEqual(abs(got - want), 2, xs)        # block-level precision
 
 
 class TrimClip(unittest.TestCase):
@@ -295,48 +366,149 @@ class TrimClip(unittest.TestCase):
         self.assertIs(si.trim_clip(meta, 0, 0), meta)
 
 
-class ShotLoopSelfHealing(unittest.TestCase):
-    """The capture loop must never wait forever: it re-arms when quiet, and
-    waits for the Omni to come back if it disconnects."""
+class BoardLoopSelfHealing(unittest.TestCase):
+    """A board's capture loop must never wait forever: it re-arms when quiet,
+    and gives up on a board that's been unplugged (the manager restarts it)."""
 
-    def run_loop(self, captures, connected):
+    def run_loop(self, board, captures, connected, clock=None):
+        import queue
         from unittest import mock
-        made, statuses = [], []
-        current = {"cap": None, "stop": False}
+        made = []
+        stop = threading.Event()
+        q = queue.Queue()
 
         class FakeCapture:
             def __init__(self, lay, cams):
                 made.append(self)
-                self.behaviour = captures[len(made) - 1]
+                if captures[len(made) - 1] == "stop":
+                    stop.set()
 
             def wait_shot(self, timeout=None):
-                if self.behaviour == "stop":
-                    current["stop"] = True
                 return False   # nothing happened within the timeout
 
             def cancel(self):
                 pass
 
-        def emit(kind, *a):
-            statuses.append(a[0] if kind == "status" else kind)
-
-        with mock.patch.object(si, "ShotCapture", FakeCapture), \
-                mock.patch.object(si, "omni_connected", side_effect=connected), \
-                mock.patch.object(si.time, "sleep"):
-            si.shot_loop({}, [0], 30, emit, current)
-        return made, statuses
+        patches = [mock.patch.object(si, "ShotCapture", FakeCapture),
+                   mock.patch.object(si, "R2Capture", FakeCapture),
+                   mock.patch.object(si, "omni_connected", side_effect=connected),
+                   mock.patch.object(si.time, "sleep")]
+        if clock:
+            patches.append(mock.patch.object(si.time, "time", side_effect=clock))
+        for p in patches:
+            p.start()
+        try:
+            si.board_loop({"board": board, "serial": "x"}, [0], 30, q, stop)
+        finally:
+            for p in patches:
+                p.stop()
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get())
+        return made, msgs
 
     def test_rearms_after_a_quiet_period(self):
-        made, statuses = self.run_loop(["quiet", "quiet", "stop"], connected=lambda: True)
-        self.assertEqual(len(made), 3)                  # re-armed twice, no hang
-        self.assertTrue(all(s.startswith("armed") for s in statuses))
+        for board in ("r1", "r2"):
+            made, msgs = self.run_loop(board, ["quiet", "quiet", "stop"], connected=lambda *_: True)
+            self.assertEqual(len(made), 3)                  # re-armed twice, no hang
+            self.assertEqual(msgs, [("armed", board)] * 3)
 
-    def test_waits_for_the_omni_to_come_back(self):
-        state = iter([False, False, False, True, True, True])
-        made, statuses = self.run_loop(["stop"], connected=lambda: next(state))
-        self.assertIn("waiting for the Omni", statuses[0])
-        self.assertTrue(statuses[1].startswith("armed"))
-        self.assertEqual(len(made), 1)
+    def test_gives_up_on_an_unplugged_board(self):
+        ticks = iter(range(0, 1000, 4))                     # each call is 4 s later
+        made, msgs = self.run_loop("r2", [], connected=lambda *_: False, clock=lambda: next(ticks))
+        self.assertEqual(made, [])
+        self.assertEqual(msgs, [("gone", "r2")])
+
+
+class SpinBoard(unittest.TestCase):
+    LOG = [
+        "Jan 1 x sqocam: ##T 7604.290 7604.289762 1 1 ( 1 2 7604.289135 ) ( 1 2 7604.289597 ) 0.000462",
+        "Jan 1 x sqocam: ##T 7614.289 7614.289178 2501 69 ( 69 2502 7614.288517 ) ( 69 2502 x ) 0.0004",
+        "Jan 1 x sqocam: ##T 7616.882 sqp_grab_stop() ",
+        "Jan 1 x sqocam: ##T 7624.807 sqp_grab_stop() ",            # a later stop: ignored
+    ]
+
+    def test_newest_buffer_from_the_log(self):
+        # the real test shot: frame 2501 at 7614.289, stop 2.593 s later -> frame 3149 -> buffer 77
+        self.assertEqual(si.r2_newest_buffer(self.LOG, 7617.477, 250.0156, 128), 77)
+        self.assertIsNone(si.r2_newest_buffer(self.LOG[2:3], 7617.477, 250.0156, 128))  # no counter
+        self.assertIsNone(si.r2_newest_buffer(self.LOG[:2], 7617.477, 250.0156, 128))   # no stop
+
+    def burst_frames(self, n, lit):
+        dark = bytes([11]) * 2000
+        bright = bytes([11]) * 1000 + bytes([230]) * 1000
+        return [bright if i in lit else dark for i in range(n)]
+
+    def lay(self):
+        return {"board": "r2", "w": 50, "h": 40, "fps": 250.0}
+
+    def test_lit_burst_from_the_predicted_window(self):
+        bufs = [(100 + p) % 128 for p in range(64)]
+        cap = {"frames": {0: self.burst_frames(64, range(30, 38))}, "buffers": bufs,
+               "ordered": True, "t_shot": 0, "t_fetched": 1}
+        seg, _ = si.r2_segment(self.lay(), cap)
+        self.assertEqual(seg["idxs"], [bufs[p] for p in range(28, 40)])  # burst +-2
+        self.assertEqual(seg["impact"], bufs[30])
+        self.assertEqual(seg["offset_ms"][2], 0.0)
+
+    def test_lit_burst_wrapping_the_whole_ring(self):
+        lit = {126, 127, 0, 1, 2}
+        cap = {"frames": {0: self.burst_frames(128, lit)}, "buffers": list(range(128)),
+               "ordered": False, "t_shot": 0, "t_fetched": 1}
+        seg, _ = si.r2_segment(self.lay(), cap)
+        self.assertEqual(seg["idxs"], [124, 125, 126, 127, 0, 1, 2, 3, 4])
+        self.assertEqual(seg["impact"], 126)
+
+    def test_no_strobe_is_ignored(self):
+        cap = {"frames": {0: self.burst_frames(64, [])}, "buffers": list(range(64)),
+               "ordered": True, "t_shot": 0, "t_fetched": 1}
+        with self.assertRaises(si.NoBall):
+            si.r2_segment(self.lay(), cap)
+
+
+class ShotManager(unittest.TestCase):
+    """Captures from both boards of the same shot become one clip (r1 then r2);
+    with one board connected, its captures are saved on their own."""
+
+    def run_manager(self, boards):
+        from unittest import mock
+        saved, emitted = [], []
+        stop = threading.Event()
+
+        def fake_loop(lay, cams, pad, q, stop_ev):
+            b = lay["board"]
+            q.put(("armed", b))
+            time.sleep(0.3 if b == "r1" else 0.6)        # r2 reports a little later
+            q.put(("segment", b, {"board": b}, f"{b} ok", [], 100.0))
+            stop_ev.wait()
+
+        def fake_save(segs, info):
+            saved.append([s["board"] for s in segs])
+            return "dir"
+
+        with mock.patch.object(si, "connected_boards", return_value={b: b for b in boards}), \
+                mock.patch.object(si, "device_layout", side_effect=lambda s: {"board": s, "serial": s}), \
+                mock.patch.object(si, "board_loop", fake_loop), \
+                mock.patch.object(si, "save_shot", fake_save), \
+                mock.patch.object(si, "sqocam_result", return_value=""), \
+                mock.patch.object(si, "write_sheets"):
+            out = si.shot_manager([0], 30, lambda *m: emitted.append(m), stop, once=True)
+        stop.set()
+        return out, saved, emitted
+
+    def test_pairs_both_boards(self):
+        out, saved, emitted = self.run_manager(["r2", "r1"])
+        self.assertEqual(out, "dir")
+        self.assertEqual(saved, [["r1", "r2"]])
+        shot = [m for m in emitted if m[0] == "shot"][0]
+        self.assertIn("r1 ok", shot[2])
+        self.assertIn("r2 ok", shot[2])
+
+    def test_single_board_saves_immediately(self):
+        t = time.time()
+        out, saved, _ = self.run_manager(["r2"])
+        self.assertEqual(saved, [["r2"]])
+        self.assertLess(time.time() - t, si.PAIR_WINDOW)   # didn't wait for a partner
 
 
 class UpdateCheck(unittest.TestCase):

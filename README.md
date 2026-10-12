@@ -43,8 +43,17 @@ folder next to the exe. The bundled adb is unpacked once to
 **From source:** Windows, Python 3 (standard library only, nothing to `pip install`),
 and `adb` (`winget install Google.PlatformTools`).
 
-1. Connect the Omni's **launch-camera USB port** (board `r1`) to the PC. It
-   shows up as `Tina ADB` in Device Manager. Check with:
+1. Connect one or both of the Omni's camera USB ports to the PC. Each shows up
+   as `Tina ADB` in Device Manager:
+
+   | Plugged in | You get |
+   |---|---|
+   | **Launch** port (board `r1`) | the swing: club coming in, contact, ball leaving (500 fps) |
+   | **Spin** port (board `r2`) | a sharp, strobe-lit close-up of the ball leaving the club (250 fps, ~10 frames) |
+   | **Both** | one clip: the launch camera's swing, then the spin camera's close-up |
+
+   square_impact checks every few seconds, so you can plug and unplug cables
+   while it's running. Check what it sees with:
    ```bash
    python square_impact.py status
    ```
@@ -55,10 +64,10 @@ and `adb` (`winget install Google.PlatformTools`).
    python square_impact.py obs
    ```
    In OBS add a **Browser Source** with URL `http://localhost:8765/` and size
-   **640×192** (or any 10:3 size). By default only the left half of the camera
-   view is shown, where the ball and club are (see `--crop`). Open
-   `http://localhost:8765/replay` in any browser to re-show the last shot while
-   you position it.
+   **640×192** (or any 10:3 size). Both cameras are shown through a 640×192
+   window that **follows the ball**, keeping it in the middle (see `--crop`).
+   Open `http://localhost:8765/replay` in any browser to re-show the last shot
+   while you position it.
 
    **Desktop viewer.** Stays open and loads every new shot:
    ```bash
@@ -81,7 +90,8 @@ Add these to the Browser Source URL, e.g. `http://localhost:8765/?gain=1.5&info=
 
 | Option  | Default | Meaning |
 |---------|---------|---------|
-| `fps`   | 30      | Playback speed. A 61-frame clip at 30 fps is ~2 s, about 1/15 real time |
+| `fps`   | 30      | Launch-camera playback speed. A 37-frame clip at 30 fps is ~1.2 s, about 1/17 real time |
+| `fps2`  | 10      | Spin-camera close-up playback speed (it's only ~10 frames, so it plays slower) |
 | `loops` | 2       | How many times the clip plays before hiding |
 | `gap`   | 250     | Pause between plays (ms) |
 | `fade`  | 300     | Fade in/out time (ms) |
@@ -108,8 +118,13 @@ square_impact.exe update [--force]                 replace the exe with the late
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
-  --crop left|right|full  part of the frame shown in the overlay and viewers
-                          (default left; saved clips always keep the full frame)
+  --crop ball|left|right|full
+                          what the overlay and viewers show (default ball: a 640x192
+                          window following the ball on both boards; saved clips
+                          always keep the full frame)
+  --no-denoise            show the launch camera's frames as captured (by default
+                          its sensor grain is averaged out, see below)
+  --board r1|r2           grab/sample: which board when both are connected
   --trim-front FRACTION   drop the start of each clip, where the club is still on
                           its way in (default 0.2 = first 12 of 61 frames; 0 shows all)
   --trim-back FRACTION    drop the end of each clip, where the ball is rolling away
@@ -121,6 +136,21 @@ common options:
 
 Viewer keys: `←`/`→` step a frame, `Space` play/pause. Buttons jump to impact
 and save the current frame as PNG.
+
+### Image quality
+
+The launch camera runs at high gain for its 500 fps, so its frames are grainy.
+By default the overlay and viewers **average each pixel with the same pixel in
+the frames around it, where it isn't changing**: the still floor gets smoothed
+(noise drops from ~5.8 to ~2.6 grey levels) while the moving club and ball stay
+sharp. It runs across several CPU cores (~0.3 s per shot). `--no-denoise`
+turns it off. The spin camera's strobe-lit frames are clean already.
+
+The **ball-following crop** finds the ball in every frame (a bright, roughly
+round blob, so club shafts, the club's marker and floor reflections are ignored)
+and centres a 640×192 window on it. Near the edge of a camera's view the window
+extends into black so the ball stays centred; once the ball has left the view,
+the window stays where it was last seen.
 
 ### Updates
 
@@ -152,11 +182,16 @@ latest release even if you already have it.
 
 ## Output
 
-Each shot is saved to `shots/<date>_<time>_r1_shot_cam0/`:
+Each shot is saved to `shots/<date>_<time>_shot_<boards>/` (e.g. `…_shot_r1+r2`):
 
-- `cam0_<buffer>.pgm`: the raw frames (1280×192, 8-bit grayscale), contact ±30 frames
-- `meta.json`: frame order, contact frame, time offsets, the Omni's event frame
-- `sheet_cam0.png`: contact sheet of the whole clip
+- `r1_cam0_<buffer>.pgm`: launch-camera frames (1280×192, 8-bit grayscale), contact ±30
+- `r2_cam0_<buffer>.pgm`: spin-camera frames (1280×384), the strobe-lit burst ±2
+- `meta.json`: one segment per board: frame order, contact / first lit frame,
+  time offsets, the Omni's event frame
+- `sheet_r1_cam0.png`, `sheet_r2_cam0.png`: contact sheets
+
+Saved files are always the full, unprocessed frames; trimming, denoising and
+cropping only happen when a shot is shown.
 
 Only the **5 newest** capture folders are kept. Older ones are deleted
 automatically (`KEEP_CAPTURES` at the top of the script).
@@ -209,6 +244,16 @@ calibration in `/tmp/sqocam.cfg`.
   frame before steady movement, typically 4–5 frames before the Omni's own
   event frame. Events with no ball in view are skipped, because sqocam
   reports those too.
+- **The spin board (`r2`).** Its IR strobe only fires for a short burst
+  right after impact, so it gives ~8 sharp, clean frames of the ball leaving
+  the club rather than a video of the swing. square_impact waits for its
+  `sqp_sfind_main return : 1` line (spin analysis done, which only happens for
+  real shots), works out where the burst is in the ring from r2's frame-counter
+  log lines and the stop time, fetches 64 frames there, and keeps the lit ones
+  ±2. r2 keeps its ring for 6–20 s after a shot, so there's time to look first.
+- **Both boards at once.** Each board is addressed by its own adb serial and
+  runs its own capture loop. Captures of the same shot (within 8 s) are saved
+  together and played r1 then r2.
 
 ### Read-only by design
 
@@ -255,10 +300,11 @@ ships in the release zip as `adb-NOTICE.txt`.
 
 ## Known limits
 
-- Developed and tested on the **launch board (`r1`) with soft putts and chips
-  indoors**. Full-speed swings, where the ball leaves the frame within a few
-  frames, and the spin board (`r2`) haven't been tested with the shot modes.
-- Only one board is read at a time (one USB connection).
+- Developed and tested with **soft putts and chips indoors**. Full-speed swings,
+  where the ball leaves the frame within a few frames, haven't been tried.
+- The spin board's burst position comes from a handful of shots (44–51 frames
+  before the stop). If it moves outside the 64-frame window on some shots, the
+  close-up will be cut short; `R2_LIT_BEFORE_NEWEST` / `R2_WINDOW` adjust it.
 - Contact detection assumes the ball starts at rest and visible in the top
   camera's view.
 - Depends on sqocam's log messages and memory layout. A firmware update may

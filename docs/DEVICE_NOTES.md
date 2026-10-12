@@ -76,6 +76,33 @@ lines for a typical shot, with times relative to the cameras stopping:
   keeps counting after the shot line, so it **can't** be used to find the
   newest buffer.
 
+## Shot timeline (`r2`)
+
+r2 is driven by the main board over MQTT and synced to r1 by a hardware trigger
+(`GPIO_TRG0`). Log lines for a typical shot, with times relative to the stop:
+
+| t | Log line | Meaning |
+|---|---|---|
+| | `sqp_matt_recv_start(0)` → `sqp_grab_start(0)` | armed; cameras run continuously at ~250 fps |
+| | `<t> <t_us> <frame#> <buffer> ( … ) ( … ) <dt>` | frame counter: at start (`1 1`) and every 2500 frames. **buffer = frame# % 128** |
+| 0 | `sqp_grab_stop()` | cameras stop (r1 saw the shot) |
+| +0.1 s | `[!@#$] sqp_sfind_main` | spin analysis starts |
+| +0.4–0.6 s | `sqp_sfind_main return : 1` | **real shot** (square_impact's r2 trigger) |
+| +6–20 s | `sqp_matt_recv_start(0)` → `sqp_grab_start(0)` | restart: **ring overwritten** |
+
+- **Aborted events:** a `sqp_grab_stop()` without `sqp_sfind_main` after it
+  (e.g. the ball was picked up) means no shot was recorded.
+- **Finding the ring position:** the newest buffer at the stop is
+  `(frame# + round((t_stop − t_counter) × 250.0156)) % 128`, using the last
+  counter line before the stop. It matched the images exactly on the test shot.
+- **The strobe burst:** the IR strobe fires for only ~8 frames (32 ms) just
+  after impact, about 44–51 frames before the newest buffer. Lit frames are
+  unmistakable: the unlit scene sits at ~11/255 while the lit ball and club
+  saturate. Unlit frames still show a dim ball at rest.
+- **Cameras:** the two r2 cameras are a synchronized stereo pair (the same
+  buffers are lit on both), with analog gain 2.0 (r1 uses 5.0), so they're far
+  less noisy: ~0.9 grey levels on the background vs ~5.8 on r1's floor.
+
 ## ADB transport quirks
 
 - **No `exec-out`, `shell -T` or `reverse`.** The device only allocates a

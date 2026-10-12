@@ -1,0 +1,3 @@
+kind: Changed
+body: The overlay and viewers show a 640x192 window that follows the ball on both cameras (`--crop ball`, the new default), keeping it centred
+time: 2026-10-11T21:32:04.9128847-05:00

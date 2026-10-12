@@ -134,11 +134,45 @@ def version_info():
 
 
 ADB = None
+SERIAL = None  # default device for single-board commands (set when several are connected)
 
 
-def shell(cmd):
-    out = subprocess.run([ADB, "shell", cmd], capture_output=True, check=True).stdout
+def adb_args(serial, *args):
+    """adb command line, addressed to one device when a serial is given."""
+    serial = serial or SERIAL
+    return [ADB] + (["-s", serial] if serial else []) + list(args)
+
+
+def shell(cmd, serial=None):
+    out = subprocess.run(adb_args(serial, "shell", cmd), capture_output=True, check=True).stdout
     return out.decode("latin-1").replace("\r", "")
+
+
+BOARD_NAMES = {"r1": "launch", "r2": "spin"}
+_board_of_serial = {}  # serial -> hostname, cached (a serial's board never changes)
+
+
+def connected_boards():
+    """{'r1': serial, 'r2': serial} for the Omni camera boards adb sees right now.
+    Each board has its own USB port, so either or both can be connected."""
+    try:
+        out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    boards = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        serial = parts[0]
+        if serial not in _board_of_serial:
+            try:
+                _board_of_serial[serial] = shell("hostname", serial).strip()
+            except (OSError, subprocess.CalledProcessError):
+                continue
+        if _board_of_serial[serial] in BOARD_MODE:
+            boards[_board_of_serial[serial]] = serial
+    return boards
 
 
 # Follow the device log by *name*, surviving rotation. On the Omni, `logread`
@@ -157,13 +191,9 @@ FOLLOW_LOG = (
 
 
 def shot_trigger(dump):
-    """Wrap `dump` so it runs the moment the next shot is logged. sqocam stamps
+    """Wrap `dump` so it runs the moment r1 logs the next shot. sqocam stamps
     its lines with uptime ("##T 2609.890"), so lines from before arming are ignored."""
-    return ("U=$(cut -d. -f1 /proc/uptime); "
-            f"{FOLLOW_LOG} | while read l; do "
-            f'case "$l" in *"{SHOT_LINE}"*) ;; *) continue;; esac; '
-            't=${l##*##T }; t=${t%%.*}; '
-            f'if [ "$t" -ge "$U" ] 2>/dev/null; then {dump}; exit; fi; done')
+    return log_trigger(SHOT_LINE, dump)
 
 
 class Stream:
@@ -175,11 +205,11 @@ class Stream:
     ends the same way, so it tells us the exact insertion; since every LF
     carries it, stripping it is lossless."""
 
-    def __init__(self, cmd, need):
+    def __init__(self, cmd, need, serial=None):
         self.need = need            # payload bytes, or callable(header) -> bytes
         self.header = self.payload = self.error = None
         self.t_marker = None
-        self.p = subprocess.Popen([ADB, "shell", cmd], stdout=subprocess.PIPE)
+        self.p = subprocess.Popen(adb_args(serial, "shell", cmd), stdout=subprocess.PIPE)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -233,18 +263,19 @@ class Stream:
         return self.header, self.payload
 
 
-def device_layout():
-    """Frame geometry for whichever board is connected, from its sqocam.cfg."""
-    board = shell("hostname").strip()
+def device_layout(serial=None):
+    """Frame geometry for a board (default: the SERIAL device), from its sqocam.cfg."""
+    board = shell("hostname", serial).strip()
     mode = BOARD_MODE.get(board)
     if not mode:
         sys.exit(f"unknown board '{board}' (expected r1 or r2)")
-    cfg = dict(re.findall(r"^(\w+)\s*=\s*(\S+)", shell("cat /tmp/sqocam.cfg"), re.M))
+    cfg = dict(re.findall(r"^(\w+)\s*=\s*(\S+)", shell("cat /tmp/sqocam.cfg", serial), re.M))
     w, h = int(cfg[f"{mode}_CAM_W"]), int(cfg[f"{mode}_CAM_H"])
     stride = 1 << (w * h - 1).bit_length()
     assert (w * h) % DD_BS == 0 and stride % DD_BS == 0
     return {"board": board, "mode": mode, "w": w, "h": h, "stride": stride,
-            "fps": float(cfg[f"{mode}_CAM_RFPS"]), "nbuf": int(cfg[f"{mode}_CAM_NBUF"])}
+            "fps": float(cfg[f"{mode}_CAM_RFPS"]), "nbuf": int(cfg[f"{mode}_CAM_NBUF"]),
+            "serial": serial or SERIAL}
 
 
 def read_frames(lay, idxs, cams=(0, 1), wait_shot=False):
@@ -332,10 +363,10 @@ def session_cmd(lay, cam, o0, n, trigger=True, f_fixed=None):
 
 
 class ShotCapture:
-    """Arm parallel sessions for the next shot; each snapshots its share of the
-    window around sqocam's event buffer the moment the shot is logged (a few MB
-    each, read in a fraction of a second, well inside the ~5 s before the
-    cameras restart). result() blocks until everything is fetched."""
+    """r1 (launch board): arm parallel sessions for the next shot; each
+    snapshots its share of the window around sqocam's event buffer the moment
+    the shot is logged (a few MB each, read in a fraction of a second, well
+    inside the ~5 s before the cameras restart). result() blocks until fetched."""
 
     def __init__(self, lay, cams, parts=SESSIONS, f_fixed=None):
         self.lay, self.cams = lay, cams
@@ -343,23 +374,20 @@ class ShotCapture:
         bounds = [self.n * k // parts for k in range(parts + 1)]
         self.parts = [(cam, o0, o1 - o0,
                        Stream(session_cmd(lay, cam, o0, o1 - o0, f_fixed is None, f_fixed),
-                              (o1 - o0) * lay["stride"]))
+                              (o1 - o0) * lay["stride"], lay.get("serial")))
                       for cam in cams for o0, o1 in zip(bounds, bounds[1:])]
 
+    def streams(self):
+        return [s for *_, s in self.parts]
+
     def cancel(self):
-        for *_, s in self.parts:
+        for s in self.streams():
             s.kill()
 
     def wait_shot(self, timeout=None):
         """Block until the shot is detected (first marker seen) or a session dies.
         Returns False if `timeout` seconds pass with neither."""
-        end = None if timeout is None else time.time() + timeout
-        while end is None or time.time() < end:
-            for *_, s in self.parts:
-                if s.t_marker or not s.thread.is_alive():
-                    return True
-            time.sleep(0.01)
-        return False
+        return wait_any(self.streams(), timeout)
 
     def result(self):
         """Frames per camera in time order, with their buffer numbers."""
@@ -374,19 +402,180 @@ class ShotCapture:
         if len(events) > 1:
             raise RuntimeError(f"sessions saw different events {sorted(events)}")
         F = events.pop()
-        t_shot = min(s.t_marker for *_, s in self.parts)
+        t_shot = min(s.t_marker for s in self.streams())
         return {"frames": frames, "event": F,
                 "buffers": [(F - FETCH_BEFORE + p) % nb for p in range(self.n)],
                 "t_shot": t_shot, "t_fetched": time.time()}
+
+
+def wait_any(streams, timeout=None):
+    """True once any stream has seen its marker (or died); False on timeout."""
+    end = None if timeout is None else time.time() + timeout
+    while end is None or time.time() < end:
+        for s in streams:
+            if s.t_marker or not s.thread.is_alive():
+                return True
+        time.sleep(0.01)
+    return False
+
+
+# ---------------------------------------------------------------- r2 (spin board)
+
+# r2's IR strobe only fires for a short burst after impact (~8 frames at 250 fps),
+# so its "clip" is a sharp, clean close-up of the ball leaving the club. Per shot
+# it logs (see docs/DEVICE_NOTES.md):
+#   <t> <t_us> <frame#> <buffer> ( ...        frame counter, every 2500 frames + at start
+#   sqp_grab_stop()                           cameras stop
+#   sqp_sfind_main return : 1                 spin analysis done = a real shot
+# and keeps the ring for 6-20 s. buffer = frame# % nbuf, so the counter line plus
+# the stop time give the newest buffer; the lit burst sits ~44-51 frames before it.
+SFIND_LINE = "sqp_sfind_main return : 1"
+R2_LIT_BEFORE_NEWEST = 48   # centre of the lit burst, in frames before the newest buffer
+R2_WINDOW = 64              # frames fetched around it (the whole ring if unknown)
+R2_LIT_LEVEL = 150          # a pixel this bright is strobe-lit (the unlit scene sits ~11)
+R2_LIT_MIN = 4              # lit pixels (in a 1-in-53 sample) for a frame to count as lit
+R2_PAD = 2                  # unlit frames kept either side of the burst
+
+
+def log_trigger(pattern, dump):
+    """Run `dump` the moment a log line containing `pattern` is written after
+    arming. $T is that line's uptime stamp ("7617.477")."""
+    return ("U=$(cut -d. -f1 /proc/uptime); "
+            f"{FOLLOW_LOG} | while read l; do "
+            f'case "$l" in *"{pattern}"*) ;; *) continue;; esac; '
+            'T=${l##*##T }; T=${T%% *}; t=${T%%.*}; '
+            f'if [ "$t" -ge "$U" ] 2>/dev/null; then {dump}; exit; fi; done')
+
+
+def snapshot_cmd(lay, cam, start, n):
+    """Device command: MARKER line, then buffers start..start+n-1 (wrapping
+    around the ring) of one camera, both spans read in parallel."""
+    nb, st = lay["nbuf"], lay["stride"]
+    base = FRAME_BASE + cam * nb * st
+
+    def snap(b, k):
+        return f"dd if=/dev/mem bs={k * st} count=1 iflag=skip_bytes skip={base + b * st} 2>/dev/null"
+    start %= nb
+    first = min(n, nb - start)
+    body = snap(start, first) if first == n else f"{snap(0, n - first)} | ({snap(start, first)}; cat)"
+    return f"stty -opost; echo {MARKER.decode()}; {body}"
+
+
+def r2_newest_buffer(log_lines, t_shot, fps, nbuf):
+    """Newest ring buffer when r2 stopped for the shot logged at `t_shot`, from
+    its frame-counter lines (buffer = frame# % nbuf) and the stop time. None if
+    the log doesn't have what's needed."""
+    stop = counter = None
+    for line in log_lines:
+        m = re.search(r"##T ([\d.]+) sqp_grab_stop", line)
+        if m and float(m[1]) <= t_shot:
+            stop = float(m[1])
+    if stop is None:
+        return None
+    for line in log_lines:
+        m = re.search(r"##T ([\d.]+) [\d.]+ (\d+) (\d+) \( ", line)
+        if m and float(m[1]) <= stop:
+            counter = (float(m[1]), int(m[2]))
+    if counter is None:
+        return None
+    t0, frame0 = counter
+    return (frame0 + round((stop - t0) * fps)) % nbuf
+
+
+def lit_frames(frames):
+    """Positions of the strobe-lit frames."""
+    return [i for i, f in enumerate(frames)
+            if sum(1 for v in f[::53] if v > R2_LIT_LEVEL) >= R2_LIT_MIN]
+
+
+class R2Capture:
+    """r2 (spin board): wait for sqocam's 'spin analysis done' line, work out
+    where the strobe-lit burst is in the ring from its log, then snapshot that
+    window with parallel sessions. r2 keeps its ring for 6-20 s after the stop,
+    so there's time to look before reading."""
+
+    def __init__(self, lay, cams, parts=SESSIONS):
+        self.lay, self.cams, self.parts = lay, cams, parts
+        self.trigger = Stream("stty -opost; " + log_trigger(SFIND_LINE, f"echo {MARKER.decode()} $T"),
+                              0, lay.get("serial"))
+        self.snaps = []
+
+    def streams(self):
+        return [self.trigger] + [s for *_, s in self.snaps]
+
+    def cancel(self):
+        for s in self.streams():
+            s.kill()
+
+    def wait_shot(self, timeout=None):
+        return wait_any([self.trigger], timeout)
+
+    def result(self):
+        lay, nb, fps = self.lay, self.lay["nbuf"], self.lay["fps"]
+        header, _ = self.trigger.result()
+        t_shot = float(header)
+        log = shell("cat /tmp/log/messages.0 /tmp/log/messages 2>/dev/null | grep sqocam | "
+                    "grep -E 'sqp_grab_stop| [0-9]+ [0-9]+ \\( '", lay.get("serial")).splitlines()
+        newest = r2_newest_buffer(log, t_shot, fps, nb)
+        if newest is None:   # fall back to the whole ring, in buffer order
+            start, n, ordered = 0, nb, False
+        else:
+            start, n, ordered = newest - R2_LIT_BEFORE_NEWEST - R2_WINDOW // 2, R2_WINDOW, True
+        bounds = [n * k // self.parts for k in range(self.parts + 1)]
+        self.snaps = [(cam, o0, o1 - o0,
+                       Stream(snapshot_cmd(lay, cam, start + o0, o1 - o0),
+                              (o1 - o0) * lay["stride"], lay.get("serial")))
+                      for cam in self.cams for o0, o1 in zip(bounds, bounds[1:])]
+        st, fb = lay["stride"], lay["w"] * lay["h"]
+        frames = {cam: [None] * n for cam in self.cams}
+        for cam, o0, k, s in self.snaps:
+            _, data = s.result()
+            for j in range(k):
+                frames[cam][o0 + j] = data[j * st:j * st + fb]
+        return {"frames": frames, "buffers": [(start + p) % nb for p in range(n)],
+                "ordered": ordered, "newest": newest, "t_shot": self.trigger.t_marker,
+                "t_fetched": time.time()}
+
+
+def r2_segment(lay, cap):
+    """The strobe-lit burst (+-R2_PAD frames) of an r2 capture, as a segment."""
+    cams = list(cap["frames"])
+    frames, buffers = cap["frames"][cams[0]], cap["buffers"]
+    lit = lit_frames(frames)
+    if not lit:
+        raise NoBall("r2: no strobe-lit frames (no ball in flight)")
+    n = len(frames)
+    if cap["ordered"]:
+        order = list(range(n))
+    else:   # whole ring in buffer order: start right after the biggest gap between lit frames
+        gaps = [((lit[(i + 1) % len(lit)] - lit[i]) % n, i) for i in range(len(lit))]
+        _, i = max(gaps)
+        first = lit[(i + 1) % len(lit)]
+        order = [(first - R2_PAD + p) % n for p in range(n)]
+        lit = [order.index(x) for x in lit]
+    lo, hi = max(0, min(lit) - R2_PAD), min(n, max(lit) + R2_PAD + 1)
+    pos = order[lo:hi]
+    first_lit = min(lit) - lo
+    seg = {"board": lay["board"], "cams": cams, "w": lay["w"], "h": lay["h"], "fps": lay["fps"],
+           "idxs": [buffers[p] for p in pos], "impact": buffers[pos[first_lit]],
+           "offset_ms": [round((k - first_lit) * 1000 / lay["fps"], 1) for k in range(len(pos))],
+           "frames": {cam: [cap["frames"][cam][p] for p in pos] for cam in cams},
+           "lit": len(lit)}
+    summary = (f"r2: {len(lit)} lit frames (buffers {seg['idxs'][0]}..{seg['idxs'][-1]}); "
+               f"fetched {n} frames/cam in {cap['t_fetched'] - cap['t_shot']:.1f}s")
+    return seg, summary
 
 
 class NoBall(Exception):
     """sqocam reported a shot, but there's no ball in view around it."""
 
 
-def sqocam_result():
-    """sqocam's own measurements for the latest shot, if logged yet."""
-    line = shell("logread -e 'sim_carry input' | tail -1")
+def sqocam_result(serial=None):
+    """sqocam's own measurements for the latest shot (logged by r1), if any."""
+    try:
+        line = shell("grep 'sim_carry input' /var/log/messages | tail -1", serial)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
     vals = dict(re.findall(r"(\w+)\(\(?(-?[\d.]+)\)", line))
     if not vals:
         return ""
@@ -394,45 +583,78 @@ def sqocam_result():
             f"direction {vals.get('bd', '?')} deg, spin {vals.get('srate', '?')} rpm")
 
 
-def process_shot(lay, cap, pad):
-    """Find the impact in the fetched window, reject events with no ball in
-    view, and save the +-pad window as a viewable capture.
-    Returns (out_dir, summary, notes)."""
+def r1_segment(lay, cap, pad):
+    """Find contact in an r1 capture, reject events with no ball in view, and
+    return the contact +-pad frames as a segment."""
     w, h, n = lay["w"], lay["h"], len(cap["buffers"])
     cams = list(cap["frames"])
     t_imp, rest, contrast = find_impact_ordered(cap["frames"][cams[0]], w, h)
     if contrast < MIN_BALL_CONTRAST:
-        raise NoBall(f"ignored sqocam event at buffer {cap['event']}: no ball in view "
+        raise NoBall(f"r1: ignored sqocam event at buffer {cap['event']}: no ball in view "
                      f"(contrast {contrast:.0f} < {MIN_BALL_CONTRAST})")
     notes = []
     if t_imp is None:
         t_imp = FETCH_BEFORE - CONTACT_BEFORE_F  # ball never tracked moving
         notes.append("ball never seen moving; contact estimated from sqocam's event frame")
-
     lo, hi = max(0, t_imp - pad), min(n, t_imp + pad + 1)
     if hi - lo < 2 * pad + 1:
         notes.append(f"impact {t_imp - FETCH_BEFORE:+d} frames from sqocam's event; "
                      f"clip cut to {hi - lo} frames")
-    window = cap["buffers"][lo:hi]
-    imp_buf = cap["buffers"][t_imp]
-    out_dir = os.path.join(SHOTS_DIR, time.strftime("%Y%m%d_%H%M%S") +
-                           f"_{lay['board']}_shot_cam{''.join(map(str, cams))}")
-    os.makedirs(out_dir, exist_ok=True)
-    for cam in cams:
-        for b, f in zip(window, cap["frames"][cam][lo:hi]):
-            write_pgm(os.path.join(out_dir, f"cam{cam}_{b:03d}.pgm"), w, h, f)
-    meta = {**lay, "idxs": window, "cams": cams, "shot": True, "impact": imp_buf, "pad": pad,
-            "offset_ms": [round((p - t_imp) * 1000 / lay["fps"], 1) for p in range(lo, hi)],
-            "motion": [motion(cap["frames"][cam][lo:hi], w) for cam in cams],
-            "sqocam_event": cap["event"], "ball_rest": rest, "ball_contrast": round(contrast)}
+    seg = {"board": lay["board"], "cams": cams, "w": w, "h": h, "fps": lay["fps"],
+           "idxs": cap["buffers"][lo:hi], "impact": cap["buffers"][t_imp], "pad": pad,
+           "offset_ms": [round((p - t_imp) * 1000 / lay["fps"], 1) for p in range(lo, hi)],
+           "frames": {cam: cap["frames"][cam][lo:hi] for cam in cams},
+           "sqocam_event": cap["event"], "ball_rest": rest, "ball_contrast": round(contrast)}
+    summary = (f"r1: contact at buffer {seg['impact']} (sqocam event {cap['event']}); "
+               f"fetched {n} frames/cam in {cap['t_fetched'] - cap['t_shot']:.1f}s")
+    return seg, summary, notes
+
+
+# ---------------------------------------------------------------- shot folders
+
+def save_shot(segments, info=""):
+    """Write one shot (one or more board segments, in play order) to shots/."""
+    boards = [s["board"] for s in segments]
+    out_dir = os.path.join(SHOTS_DIR, time.strftime("%Y%m%d_%H%M%S") + "_shot_" + "+".join(boards))
+    base, k = out_dir, 1
+    while os.path.exists(out_dir):
+        k += 1
+        out_dir = f"{base}_{k}"
+    os.makedirs(out_dir)
+    metas = []
+    for s in segments:
+        for cam in s["cams"]:
+            for b, f in zip(s["idxs"], s["frames"][cam]):
+                write_pgm(os.path.join(out_dir, f"{s['board']}_cam{cam}_{b:03d}.pgm"), s["w"], s["h"], f)
+        metas.append({k: v for k, v in s.items() if k != "frames"})
     with open(os.path.join(out_dir, "meta.json"), "w") as fh:
-        json.dump(meta, fh)
-    fetch = cap["t_fetched"] - cap["t_shot"]
-    mb = len(cams) * n * lay["stride"] / 1e6
-    summary = (f"impact at buffer {imp_buf} (sqocam event {cap['event']}); "
-               f"fetched {n} frames/cam ({mb:.0f} MB) in {fetch:.1f}s")
+        json.dump({"shot": True, "boards": boards, "segments": metas, "sqocam": info}, fh)
     prune_captures()
-    return out_dir, summary, notes
+    return out_dir
+
+
+def load_shot(shot_dir):
+    """Segments of a saved capture, frames included. Also reads the older
+    single-board folders (meta with idxs/cams at the top, files camN_BBB.pgm)."""
+    with open(os.path.join(shot_dir, "meta.json")) as fh:
+        meta = json.load(fh)
+    if "segments" in meta:
+        metas, prefix = meta["segments"], "{board}_"
+    else:
+        metas = [{**meta, "board": meta.get("board", "r1"), "cams": meta.get("cams", [0, 1])}]
+        prefix = ""
+    segs = []
+    for m in metas:
+        w, h = m["w"], m["h"]
+        frames = {}
+        for cam in m["cams"]:
+            frames[cam] = []
+            for b in m["idxs"]:
+                name = prefix.format(board=m["board"]) + f"cam{cam}_{b:03d}.pgm"
+                with open(os.path.join(shot_dir, name), "rb") as fh:
+                    frames[cam].append(fh.read()[-w * h:])
+        segs.append({**m, "frames": frames})
+    return segs
 
 
 def prune_captures(keep=KEEP_CAPTURES):
@@ -444,23 +666,21 @@ def prune_captures(keep=KEEP_CAPTURES):
 
 
 def write_sheets(out_dir):
-    with open(os.path.join(out_dir, "meta.json")) as fh:
-        meta = json.load(fh)
-    w, h = meta["w"], meta["h"]
-    for cam in meta["cams"]:
-        frames = []
-        for b in meta["idxs"]:
-            with open(os.path.join(out_dir, f"cam{cam}_{b:03d}.pgm"), "rb") as fh:
-                frames.append(fh.read()[-w * h:])
-        grid_sheet(os.path.join(out_dir, f"sheet_cam{cam}.png"), frames, w, h)
+    """Contact sheet per board segment and camera, full resolution halved."""
+    for s in load_shot(out_dir):
+        for cam in s["cams"]:
+            name = f"sheet_{s['board']}_cam{cam}.png"
+            grid_sheet(os.path.join(out_dir, name), s["frames"][cam], s["w"], s["h"])
 
 
 # ---------------------------------------------------------------- image output
 
-# Horizontal crop for display (OBS overlay, viewers); saved clips stay full-frame.
-# The ball and club sit in the left half of the launch camera's view.
-CROPS = {"full": (0.0, 1.0), "left": (0.0, 0.5), "right": (0.5, 1.0)}
-DISPLAY_CROP = "left"  # set from --crop
+# Crop for display (OBS overlay, viewers); saved clips stay full-frame.
+# "ball" (default): a BALL_CROP window that follows the ball on both cameras;
+# the others are fixed horizontal slices of the launch camera's frame.
+CROPS = {"ball": (0.0, 1.0), "full": (0.0, 1.0), "left": (0.0, 0.5), "right": (0.5, 1.0)}
+DISPLAY_CROP = "ball"  # set from --crop
+BALL_CROP = (640, 192)  # 10:3 on both boards, so the OBS source never changes size
 # The start of a clip is mostly the club still on its way in, and the end the
 # ball rolling away; drop these fractions of the frames before showing it
 # (saved clips keep every frame).
@@ -492,6 +712,107 @@ def trim_clip(meta, front=0.0, back=0.0):
 def crop_columns(w, crop):
     a, b = CROPS[crop]
     return int(w * a), int(w * b)
+
+
+def crop_window(f, w, h, cx, cy, cw, ch):
+    """A cw x ch window of a w x h frame centred on (cx, cy). Horizontally the
+    centre is exact: past the frame's left/right edge the window is filled with
+    black, so the ball stays in the middle even near an edge of the camera's view.
+    Vertically it's kept inside the frame (no black bars above/below)."""
+    ch = min(ch, h)
+    x0 = round(cx - cw / 2)
+    y0 = max(0, min(h - ch, round(cy - ch / 2)))
+    a, b = max(0, x0), min(w, x0 + cw)            # part of the window inside the frame
+    left, right = bytes(max(0, a - x0)), bytes(max(0, x0 + cw - max(a, b)))
+    if a >= b:
+        return bytes(cw * ch)
+    return b"".join(left + f[(y0 + y) * w + a:(y0 + y) * w + b] + right for y in range(ch))
+
+
+BLOB_CONTRAST = 60   # a block this much brighter than its row's median is "bright"
+BLOB_MIN_BLOCKS = 4  # smallest blob (in 4x4 blocks) that can be the ball
+
+
+def ball_blob(f, w, h, with_size=False):
+    """Centre (x, y) of the ball in one frame, or None if it isn't visible
+    (with_size: (x, y, blocks)).
+
+    Blocks much brighter than the typical brightness of their row are grouped
+    into connected blobs; the ball is the largest one that's about as wide as it
+    is tall or wider (club highlights are thin lines or small marks). Works on
+    both the strobe-lit dark scene and the grey floor of brighter rooms."""
+    B = block_means(f, w, h)
+    bh, bw = len(B), len(B[0])
+    hot = []
+    for row in B:
+        thr = sorted(row)[bw // 2] + BLOB_CONTRAST
+        hot.append([v > thr for v in row])
+    seen = [[False] * bw for _ in range(bh)]
+    best, best_score = None, 0
+    for y0 in range(bh):
+        for x0 in range(bw):
+            if not hot[y0][x0] or seen[y0][x0]:
+                continue
+            stack, cells = [(y0, x0)], []
+            seen[y0][x0] = True
+            while stack:
+                y, x = stack.pop()
+                cells.append((y, x))
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= ny < bh and 0 <= nx < bw and hot[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((ny, nx))
+            if len(cells) < BLOB_MIN_BLOCKS:
+                continue
+            ys, xs = [c[0] for c in cells], [c[1] for c in cells]
+            width, height = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+            # the ball reads as an ellipse ~1-3.5x wider than tall; club shafts are
+            # tall and thin, floor markers and reflections long and flat: not the ball
+            if not 0.8 * height <= width <= 4 * height:
+                continue
+            score = len(cells)
+            if score > best_score:
+                wsum = sum(B[y][x] for y, x in cells)
+                best_score = score
+                best = (sum((x * BLOCK + 2) * B[y][x] for y, x in cells) / wsum,
+                        sum((y * BLOCK + 2) * B[y][x] for y, x in cells) / wsum, len(cells))
+    return best if best is None or with_size else best[:2]
+
+
+def ball_path(frames, w, h, board=None):
+    """Where the ball is in each frame, for the crop to follow, smoothed.
+    Frames where it isn't visible (r2's unlit frames, or after it leaves the
+    view) are filled in: interpolated between known positions, and held at the
+    first/last position before/after them (rather than panning off into black)."""
+    if not frames:
+        return []
+    found = [ball_blob(f, w, h, with_size=True) for f in frames]
+    sizes = sorted(b[2] for b in found if b)
+    if not sizes:
+        return [(w / 2, h / 2)] * len(frames)
+    # the ball is about the same size all clip; a much smaller blob (once the ball
+    # has left the view: the club's marker or a glint) isn't it
+    typical = sizes[len(sizes) // 2]
+    pos = [(b[0], b[1]) if b and b[2] >= 0.4 * typical else None for b in found]
+    known = [i for i, p in enumerate(pos) if p]
+    if not known:
+        return [(w / 2, h / 2)] * len(frames)
+    filled = []
+    for i in range(len(pos)):
+        if pos[i]:
+            filled.append(pos[i])
+        elif i < known[0]:
+            filled.append(pos[known[0]])
+        elif i > known[-1]:
+            filled.append(pos[known[-1]])   # it has left the view: stay where it was last seen
+        else:
+            a = max(k for k in known if k < i)
+            b = min(k for k in known if k > i)
+            r = (i - a) / (b - a)
+            filled.append(tuple(pos[a][k] + (pos[b][k] - pos[a][k]) * r for k in (0, 1)))
+    n = len(filled)   # light, centred smoothing: steadies the pan without lagging the ball
+    return [tuple(sum(p[k] for p in filled[max(0, i - 1):i + 2]) / len(filled[max(0, i - 1):i + 2])
+                  for k in (0, 1)) for i in range(n)]
 
 
 def crop_frame(f, w, h, x0, x1):
@@ -739,28 +1060,134 @@ def latest_capture():
 
 
 def status():
-    lay = device_layout()
-    print(f"{lay['board']} ({lay['mode']}): {lay['w']}x{lay['h']} @ {lay['fps']:.0f} fps, "
-          f"{lay['nbuf']} buffers/camera, slot stride {lay['stride']:#x}")
-    print(shell(f"logread | grep -E 'grab_st|{SHOT_LINE}' | tail -4"))
+    boards = connected_boards()
+    if not boards:
+        print("no Omni camera board connected (plug in the launch and/or spin USB port)")
+        return
+    for b, serial in sorted(boards.items()):
+        lay = device_layout(serial)
+        print(f"{b} ({BOARD_NAMES[b]}, {lay['mode']}): {lay['w']}x{lay['h']} @ {lay['fps']:.0f} fps, "
+              f"{lay['nbuf']} buffers/camera, slot stride {lay['stride']:#x}, adb {serial}")
+        print(shell(f"grep sqocam /var/log/messages | grep -E 'grab_st|{SHOT_LINE}|{SFIND_LINE}' | "
+                    "sed 's/^.*##T /  /' | tail -4", serial))
+
+
+# ---------------------------------------------------------------- display pipeline
+
+DISPLAY_DENOISE = True  # set from --no-denoise
+
+
+_POOL = None
+
+
+def process_pool():
+    """Worker processes for denoising (pure-Python pixel loops; ~1.5 s for a
+    clip on one core). Started once, in the background, by obs/live."""
+    global _POOL
+    if _POOL is None:
+        import concurrent.futures
+        _POOL = concurrent.futures.ProcessPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+    return _POOL
+
+
+def warm_up_pool():
+    """Start the worker processes now so the first shot doesn't pay for it."""
+    threading.Thread(target=lambda: list(process_pool().map(abs, range(8))), daemon=True).start()
+
+
+def denoise(frames, radius=3, thr=14, parallel=True):
+    """Motion-aware temporal denoise for r1's grainy frames: each pixel is
+    averaged with the same pixel in up to `radius` frames either side, but only
+    those within `thr` grey levels of it. The still floor gets averaged (noise
+    5.8 -> 2.6 grey levels on real shots) while the moving club and ball, whose
+    pixels change by far more, are left sharp. Split across worker processes."""
+    n = len(frames)
+    if parallel and n >= 8:
+        try:
+            pool = process_pool()
+            k = min(8, n)
+            bounds = [n * i // k for i in range(k + 1)]
+            jobs = [pool.submit(_denoise_span, frames[max(0, lo - radius):min(n, hi + radius)],
+                                lo - max(0, lo - radius), hi - lo, radius, thr)
+                    for lo, hi in zip(bounds, bounds[1:])]
+            return [f for j in jobs for f in j.result()]
+        except (OSError, RuntimeError):   # no worker processes available: do it here
+            pass
+    return _denoise_span(frames, 0, n, radius, thr)
+
+
+def _denoise_span(frames, first, count, radius, thr):
+    """Denoise frames[first:first+count] using the neighbours present in `frames`."""
+    out = []
+    for t in range(first, first + count):
+        cur = frames[t]
+        nbrs = [frames[k] for k in range(max(0, t - radius), min(len(frames), t + radius + 1)) if k != t]
+        o = bytearray(len(cur))
+        for i, v in enumerate(cur):
+            s, n = v, 1
+            for f in nbrs:
+                u = f[i]
+                if -thr < u - v < thr:
+                    s += u
+                    n += 1
+            o[i] = (s + n // 2) // n
+        out.append(bytes(o))
+    return out
+
+
+def display_segments(shot_dir):
+    """A saved shot as shown in the overlay and viewers: per board segment, the
+    frames trimmed (r1), denoised (r1), cropped (--crop; by default a window
+    that follows the ball) and with cameras stacked. Saved files are never changed."""
+    out = []
+    for s in load_shot(shot_dir):
+        idxs = s["idxs"]
+        lo, hi = 0, len(idxs)
+        r1 = s["board"] == "r1"
+        if r1 and s.get("impact") in idxs:
+            t = trim_clip(s, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)
+            lo = idxs.index(t["idxs"][0])
+            hi = lo + len(t["idxs"])
+        w, h = s["w"], s["h"]
+        follow = DISPLAY_CROP == "ball" and "impact" in s   # raw grab/sample captures stay whole
+        per_cam = []
+        for cam in s["cams"]:
+            raw = s["frames"][cam][lo:hi]
+            frames = denoise(raw) if r1 and DISPLAY_DENOISE else raw   # before cropping: needs aligned frames
+            if follow:
+                cw, ch = BALL_CROP
+                path = ball_path(raw, w, h, s["board"])
+                frames = [crop_window(f, w, h, x, y, cw, ch) for f, (x, y) in zip(frames, path)]
+            else:
+                x0, x1 = crop_columns(w, DISPLAY_CROP if r1 and DISPLAY_CROP != "ball" else "full")
+                cw, ch = x1 - x0, h
+                frames = [crop_frame(f, w, h, x0, x1) for f in frames]
+            per_cam.append(frames)
+        offs = s.get("offset_ms")
+        out.append({"board": s["board"], "w": cw, "h": ch * len(s["cams"]),
+                    "frames": [b"".join(fs) for fs in zip(*per_cam)],
+                    "idxs": idxs[lo:hi], "offset_ms": offs[lo:hi] if offs else None,
+                    "impact": idxs[lo:hi].index(s["impact"]) if s.get("impact") in idxs[lo:hi] else None,
+                    "fps": s.get("fps")})
+    return out
 
 
 # ---------------------------------------------------------------- viewer
 
 class Viewer:
-    """Tk window showing one capture; load() swaps in another (used by live)."""
+    """Tk window playing one shot (its board segments in sequence); load()
+    swaps in another (used by live)."""
 
-    def __init__(self, title="Omni frames", crop=None):
+    def __init__(self, title="Omni frames"):
         import tkinter as tk
         self.tk = tk
-        self.crop = crop or DISPLAY_CROP
         self.root = tk.Tk()
         self.root.title(title)
         self.root.configure(bg="#111")
-        self.meta, self.dir, self.labels, self.imgs = None, None, [], {}
+        self.segs, self.play, self.dir, self.imgs = [], [], None, {}
         self.state = {"i": 0, "play": False}
-        self.frame = tk.Frame(self.root, bg="#111")
-        self.frame.grid(row=0, column=0, padx=6, pady=3)
+        self.label = tk.Label(self.root, bg="#111")
+        self.label.grid(row=0, column=0, padx=6, pady=6)
         self.info = tk.Label(self.root, fg="#ddd", bg="#111", font=("Consolas", 10), anchor="w")
         self.info.grid(row=1, column=0, sticky="we", padx=6)
         self.scale = tk.Scale(self.root, from_=0, to=1, orient="horizontal", length=1000,
@@ -789,54 +1216,41 @@ class Viewer:
         self.status.configure(text=text)
 
     def load(self, shot_dir):
-        with open(os.path.join(shot_dir, "meta.json")) as fh:
-            self.meta = json.load(fh)
-        if "impact" in self.meta:  # shot clips only; raw grab/sample captures stay whole
-            self.meta = trim_clip(self.meta, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)
+        self.segs = display_segments(shot_dir)
+        self.play = [(si, fi) for si, s in enumerate(self.segs) for fi in range(len(s["frames"]))]
         self.dir, self.imgs = shot_dir, {}
-        cams = self.meta.get("cams", [0, 1])
-        for lbl in self.labels:
-            lbl.destroy()
-        self.labels = [self.tk.Label(self.frame, bg="#111") for _ in cams]
-        for row, lbl in enumerate(self.labels):
-            lbl.grid(row=row, column=0, pady=3)
-        self.scale.configure(to=len(self.meta["idxs"]) - 1)
+        self.scale.configure(to=max(0, len(self.play) - 1))
         self.root.title(f"Omni frames - {os.path.basename(shot_dir)}")
         self.goto_impact()
 
-    def image(self, cam, idx):
-        key = (cam, idx)
-        if key not in self.imgs:
-            full = self.tk.PhotoImage(file=os.path.join(self.dir, f"cam{cam}_{idx:03d}.pgm"))
-            x0, x1 = crop_columns(full.width(), self.crop)
-            if (x0, x1) == (0, full.width()):
-                self.imgs[key] = full
-            else:
-                img = self.tk.PhotoImage(width=x1 - x0, height=full.height())
-                img.tk.call(img, "copy", full, "-from", x0, 0, x1, full.height())
-                self.imgs[key] = img
-        return self.imgs[key]
+    def image(self, si, fi):
+        if (si, fi) not in self.imgs:
+            s = self.segs[si]
+            pgm = b"P5\n%d %d\n255\n" % (s["w"], s["h"]) + s["frames"][fi]
+            self.imgs[(si, fi)] = self.tk.PhotoImage(data=pgm, format="PPM")
+        return self.imgs[(si, fi)]
 
     def show(self, i):
-        if not self.meta:
+        if not self.play:
             return
-        meta, n = self.meta, len(self.meta["idxs"])
-        self.state["i"] = i % n
-        idx = meta["idxs"][self.state["i"]]
-        cams = meta.get("cams", [0, 1])
-        for lbl, cam in zip(self.labels, cams):
-            lbl.configure(image=self.image(cam, idx))
-        when = (f"t = {meta['offset_ms'][self.state['i']]:+6.1f} ms from impact"
-                + ("  <<< IMPACT" if idx == meta["impact"] else "")
-                if "offset_ms" in meta else f"buffer spacing = {1000.0 / meta['fps']:.2f} ms")
-        self.info.configure(text=f"buffer {idx:3d}  ({self.state['i'] + 1}/{n})   {when}")
+        self.state["i"] = i % len(self.play)
+        si, fi = self.play[self.state["i"]]
+        s = self.segs[si]
+        self.label.configure(image=self.image(si, fi))
+        ref = "contact" if s["board"] == "r1" else "first lit frame"
+        when = (f"t = {s['offset_ms'][fi]:+6.1f} ms from {ref}"
+                + ("  <<< IMPACT" if fi == s["impact"] and s["board"] == "r1" else "")
+                if s["offset_ms"] else f"buffer {s['idxs'][fi]}")
+        self.info.configure(text=f"{s['board']} ({BOARD_NAMES.get(s['board'], '')})  "
+                                 f"frame {fi + 1}/{len(s['frames'])}   {when}")
         if self.scale.get() != self.state["i"]:
             self.scale.set(self.state["i"])
 
     def goto_impact(self):
-        if self.meta:
-            imp = self.meta.get("impact")
-            self.show(self.meta["idxs"].index(imp) if imp in self.meta["idxs"] else 0)
+        for i, (si, fi) in enumerate(self.play):
+            if fi == self.segs[si]["impact"]:
+                return self.show(i)
+        self.show(0)
 
     def step(self, d):
         self.state["play"] = False
@@ -853,13 +1267,13 @@ class Viewer:
             self.tick()
 
     def save_png(self):
-        if not self.meta:
+        if not self.play:
             return
-        idx = self.meta["idxs"][self.state["i"]]
-        out = os.path.join(self.dir, f"buffer_{idx:03d}")
-        for cam in self.meta.get("cams", [0, 1]):
-            self.image(cam, idx).write(f"{out}_cam{cam}.png", format="png")
-        self.set_status(f"saved {out}_cam*.png")
+        si, fi = self.play[self.state["i"]]
+        s = self.segs[si]
+        out = os.path.join(self.dir, f"{s['board']}_frame_{fi + 1:03d}.png")
+        self.image(si, fi).write(out, format="png")
+        self.set_status(f"saved {out}")
 
 
 def view(shot_dir=None):
@@ -868,97 +1282,167 @@ def view(shot_dir=None):
     v.root.mainloop()
 
 
-def shot_once(cams, pad):
-    lay = device_layout()
-    cap = ShotCapture(lay, cams)
-    print(f"{lay['board']}: armed; hit a shot (Ctrl+C to cancel)...")
+# ---------------------------------------------------------------- capture loops
+
+REARM_AFTER = 300   # seconds without a shot before a board's sessions are re-armed
+PAIR_WINDOW = 8.0   # seconds to wait for the other board's capture of the same shot
+
+
+def omni_connected(serial=None):
+    """True if adb sees that board right now."""
     try:
-        cap.wait_shot()
-        print("shot detected, fetching...")
-        res = cap.result()
-    finally:
-        cap.cancel()
-    try:
-        out_dir, summary, notes = process_shot(lay, res, pad)
-    except NoBall as e:
-        sys.exit(str(e))
-    print(summary, sqocam_result(), *notes, f"saved {out_dir}", sep="\n")
-    return out_dir
-
-
-REARM_AFTER = 300  # seconds without a shot before the sessions are re-armed
-
-
-def omni_connected():
-    """True if adb sees the Omni right now."""
-    try:
-        out = subprocess.run([ADB, "get-state"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run(adb_args(serial, "get-state"), capture_output=True, text=True, timeout=5)
         return out.stdout.strip() == "device"
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def shot_loop(lay, cams, pad, emit, current):
-    """Arm, wait for a shot, fetch, process; repeat until current["stop"].
-    Reports through emit(kind, ...): ("status", text) and
-    ("shot", out_dir, summary, t_shot, sqocam_text).
+def board_loop(lay, cams, pad, out_q, stop):
+    """Arm/capture loop for one board (r1 launch or r2 spin). Reports to out_q:
+    ("armed"|"fetching", board), ("segment", board, seg, summary, notes, t_shot),
+    ("ignored"|"error", board, text), ("gone", board).
 
-    Self-healing for long sessions: if no shot arrives within REARM_AFTER
-    seconds the sessions are re-armed (clears any silently stalled adb
-    session), and if the Omni disconnects, sleeps or reboots, it waits for it
-    to come back instead of failing."""
-    while not current["stop"]:
+    Self-healing: re-arms after REARM_AFTER quiet seconds (clears any silently
+    stalled adb session), and exits if the board is gone for 10 s (the manager
+    starts a new loop when it comes back)."""
+    board, serial = lay["board"], lay["serial"]
+    gone_since = None
+    while not stop.is_set():
+        cap = None
         try:
-            if not omni_connected():
-                emit("status", "waiting for the Omni (check USB / power)...")
-                while not current["stop"] and not omni_connected():
-                    time.sleep(3)
-                if current["stop"]:
-                    break
-            cap = current["cap"] = ShotCapture(lay, cams)
-            emit("status", f"armed: hit a shot  ({time.strftime('%H:%M:%S')})")
-            if not cap.wait_shot(timeout=REARM_AFTER):
-                cap.cancel()  # quiet for a while: re-arm with fresh sessions
+            if not omni_connected(serial):
+                gone_since = gone_since or time.time()
+                if time.time() - gone_since > 10:
+                    out_q.put(("gone", board))
+                    return
+                time.sleep(2)
                 continue
-            if current["stop"]:
-                break
-            emit("status", "shot! fetching frames...")
+            gone_since = None
+            cap = R2Capture(lay, cams) if board == "r2" else ShotCapture(lay, cams)
+            out_q.put(("armed", board))
+            if not cap.wait_shot(timeout=REARM_AFTER) or stop.is_set():
+                continue
+            out_q.put(("fetching", board))
             res = cap.result()
             cap.cancel()
-            out_dir, summary, notes = process_shot(lay, res, pad)
-            info = sqocam_result()  # logged ~0.5 s after the shot; long done by now
-            emit("shot", out_dir, summary + "".join("   | " + n for n in notes),
-                 res["t_shot"], info)
-            write_sheets(out_dir)  # after display; not on the critical path
+            if board == "r2":
+                seg, summary = r2_segment(lay, res)
+                notes = []
+            else:
+                seg, summary, notes = r1_segment(lay, res, pad)
+            out_q.put(("segment", board, seg, summary, notes, res["t_shot"]))
         except NoBall as e:
-            emit("status", f"{e}; re-armed")
-        except Exception as e:  # noqa: BLE001 - keep the loop alive, show the error
-            if current["stop"]:
+            out_q.put(("ignored", board, str(e)))
+        except Exception as e:  # noqa: BLE001 - keep the loop alive, report the error
+            if stop.is_set():
                 break
-            if not omni_connected():
-                continue  # lost the Omni mid-capture; the top of the loop waits for it
+            if not omni_connected(serial):
+                continue
             traceback.print_exc()
-            emit("status", f"error: {e}; re-arming")
+            out_q.put(("error", board, str(e)))
             time.sleep(1)
         finally:
-            if current["cap"]:
-                current["cap"].cancel()
+            if cap:
+                cap.cancel()
+
+
+def shot_manager(cams, pad, emit, stop, once=False):
+    """Capture from whichever camera boards are plugged in. Runs a board_loop
+    per connected board (r1 launch, r2 spin), re-checking every few seconds as
+    cables come and go, and pairs their captures of the same shot into one
+    clip: r1's swing, then r2's close-up of the ball leaving the club.
+
+    Reports through emit(kind, ...): ("status", text) and
+    ("shot", out_dir, summary, t_shot, sqocam_text). With once=True, returns
+    the folder of the first shot."""
+    q = queue.Queue()
+    workers, state, serials = {}, {}, {}
+    pending, first_at, last_scan = [], None, 0.0
+
+    shown = [None]
+
+    def report():   # only when it changes, so the console isn't flooded
+        text = ("   ".join(f"{b} {BOARD_NAMES[b]}: {state.get(b, '')}" for b in sorted(workers))
+                or "waiting for the Omni: connect the launch (r1) and/or spin (r2) USB port...")
+        if text != shown[0]:
+            shown[0] = text
+            emit("status", text)
+
+    def finish():
+        segs = [p[1] for p in sorted(pending, key=lambda p: p[0])]   # r1 before r2
+        info = sqocam_result(serials.get("r1") or serials.get(segs[0]["board"]))
+        out_dir = save_shot(segs, info)
+        summary = "  |  ".join(p[2] + "".join("; " + n for n in p[3]) for p in pending)
+        emit("shot", out_dir, summary, min(p[4] for p in pending), info)
+        threading.Thread(target=write_sheets, args=(out_dir,), daemon=True).start()
+        return out_dir
+
+    while not stop.is_set():
+        if time.time() - last_scan > 5:
+            last_scan = time.time()
+            for b, serial in connected_boards().items():
+                if b not in workers or not workers[b].is_alive():
+                    lay = device_layout(serial)
+                    serials[b] = serial
+                    workers[b] = threading.Thread(target=board_loop, args=(lay, cams, pad, q, stop),
+                                                  daemon=True)
+                    workers[b].start()
+                    state[b] = "starting"
+            for b in [b for b, t in workers.items() if not t.is_alive()]:
+                del workers[b]
+                state.pop(b, None)
+            report()
+        if pending and ({p[0] for p in pending} >= set(workers) or time.time() - first_at > PAIR_WINDOW):
+            out_dir = finish()
+            pending, first_at = [], None
+            if once:
+                return out_dir
+        try:
+            msg = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        kind, b = msg[0], msg[1]
+        if kind == "armed":
+            state[b] = "armed"
+        elif kind == "fetching":
+            state[b] = "shot! fetching"
+        elif kind == "segment":
+            pending.append((b, msg[2], msg[3], msg[4], msg[5]))
+            first_at = first_at or time.time()
+            state[b] = "captured"
+        elif kind == "ignored":
+            state[b] = "ignored (no ball in view)"
+            print(msg[2], flush=True)
+        elif kind == "error":
+            state[b] = f"error: {msg[2]}"
+        elif kind == "gone":
+            workers.pop(b, None)
+            state.pop(b, None)
+        report()
+    return None
+
+
+def shot_once(cams, pad):
+    stop = threading.Event()
+
+    def emit(kind, *a):
+        print(a[0] if kind == "status" else f"{a[1]}\nsaved {a[0]}", flush=True)
+    try:
+        return shot_manager(cams, pad, emit, stop, once=True)
+    finally:
+        stop.set()
 
 
 def live(cams, pad):
     """Viewer that re-arms after every shot and shows each one as it lands."""
-    lay = device_layout()
-    v = Viewer(f"Omni live - {lay['board']}")
+    v = Viewer("Omni live")
     q = queue.Queue()
-    current = {"cap": None, "stop": False}
+    stop = threading.Event()
     shown = {"last": [], "state": ""}
 
     def emit(*msg):
         print(*msg[1:3], flush=True)
         q.put(msg)
-
-    def worker():
-        shot_loop(lay, cams, pad, emit, current)
 
     def pump():
         try:
@@ -977,13 +1461,13 @@ def live(cams, pad):
         v.root.after(50, pump)
 
     def close():
-        current["stop"] = True
-        if current["cap"]:
-            current["cap"].cancel()
+        stop.set()
         v.root.destroy()
 
     v.root.protocol("WM_DELETE_WINDOW", close)
-    threading.Thread(target=worker, daemon=True).start()
+    if DISPLAY_DENOISE:
+        warm_up_pool()
+    threading.Thread(target=shot_manager, args=(cams, pad, emit, stop), daemon=True).start()
     if os.path.isdir(SHOTS_DIR) and glob.glob(os.path.join(SHOTS_DIR, "*", "meta.json")):
         try:
             v.load(latest_capture())
@@ -1008,11 +1492,13 @@ OVERLAY_PAGE = r"""<!doctype html>
 </style></head>
 <body><div id="wrap"><canvas id="c"></canvas><div id="info"></div></div>
 <script>
-// URL options: fps (playback speed, default 30), loops (2), gap (ms between loops, 250),
-// fade (ms, 300), gain (brightness multiplier, 1), info=1 (show sqocam's numbers)
+// URL options: fps (launch-camera playback speed, default 30), fps2 (spin-camera
+// close-up, default 10), loops (2), gap (ms between loops, 250), fade (ms, 300),
+// gain (brightness multiplier, 1), info=1 (show sqocam's numbers)
 const P = new URLSearchParams(location.search);
-const FPS = +P.get('fps') || 30, LOOPS = +P.get('loops') || 2, GAP = +(P.get('gap') ?? 250),
-      FADE = +P.get('fade') || 300, GAIN = +P.get('gain') || 1, INFO = P.get('info') === '1';
+const FPS = +P.get('fps') || 30, FPS2 = +P.get('fps2') || 10, LOOPS = +P.get('loops') || 2,
+      GAP = +(P.get('gap') ?? 250), FADE = +P.get('fade') || 300, GAIN = +P.get('gain') || 1,
+      INFO = P.get('info') === '1';
 document.documentElement.style.setProperty('--fade', FADE + 'ms');
 const wrap = document.getElementById('wrap'), cv = document.getElementById('c'),
       ctx = cv.getContext('2d'), infoEl = document.getElementById('info');
@@ -1025,25 +1511,41 @@ async function show(s) {
   const my = ++token;
   const buf = new Uint8Array(await (await fetch('/shot/' + s.id + '.bin')).arrayBuffer());
   if (my !== token) return;                      // a newer shot arrived meanwhile
-  cv.width = s.w; cv.height = s.h;
-  const img = ctx.createImageData(s.w, s.h), px = new Uint32Array(img.data.buffer);
-  const size = s.w * s.h, frameMs = 1000 / FPS, loopMs = s.n * frameMs + GAP;
-  const draw = f => { const o = f * size; for (let i = 0; i < size; i++) px[i] = lut[buf[o + i]];
-                      ctx.putImageData(img, 0, 0); };
-  draw(0);
+  // One timeline over all segments: the launch camera's swing, then the spin
+  // camera's close-up (each with its own size and playback speed).
+  const tl = []; let off = 0, t = 0;
+  for (const g of s.segments) {
+    const ms = 1000 / (g.board === 'r2' ? FPS2 : FPS);
+    for (let f = 0; f < g.n; f++) { tl.push({ g, o: off + f * g.w * g.h, start: t }); t += ms; }
+    off += g.n * g.w * g.h;
+  }
+  const loopMs = t + GAP;
+  let img = null, px = null;
+  const draw = e => {
+    if (cv.width !== e.g.w || cv.height !== e.g.h || !img) {
+      cv.width = e.g.w; cv.height = e.g.h;
+      img = ctx.createImageData(e.g.w, e.g.h); px = new Uint32Array(img.data.buffer);
+    }
+    const size = e.g.w * e.g.h;
+    for (let i = 0; i < size; i++) px[i] = lut[buf[e.o + i]];
+    ctx.putImageData(img, 0, 0);
+  };
+  draw(tl[0]);
   infoEl.textContent = INFO ? (s.info || '') : '';
   wrap.classList.add('on');
   // Timer-driven from wall-clock time (not requestAnimationFrame, which stalls
   // when the page isn't being painted), so the hide always happens on schedule.
   const t0 = performance.now() + FADE;           // start playing once faded in
-  let last = -1;
+  let last = null;
   const tick = setInterval(() => {
     if (my !== token) return clearInterval(tick);
-    const t = Math.max(0, performance.now() - t0), loop = Math.floor(t / loopMs);
+    const el = Math.max(0, performance.now() - t0), loop = Math.floor(el / loopMs);
     if (loop >= LOOPS) { clearInterval(tick); wrap.classList.remove('on'); return; }
-    const f = Math.min(s.n - 1, Math.floor((t - loop * loopMs) / frameMs));
-    if (f !== last) { draw(f); last = f; }
-  }, Math.max(4, frameMs / 2));
+    const lt = el - loop * loopMs;
+    let e = tl[0];
+    for (const x of tl) { if (x.start <= lt) e = x; else break; }
+    if (e !== last) { draw(e); last = e; }
+  }, 8);
 }
 
 const es = new EventSource('/events');
@@ -1053,8 +1555,8 @@ es.onmessage = e => show(JSON.parse(e.data));
 
 
 class Overlay:
-    """Latest shot, served to the OBS browser source: frames as raw 8-bit gray
-    (all cameras stacked vertically per frame), announced over server-sent events."""
+    """Latest shot, served to the OBS browser source: frames as raw 8-bit gray,
+    announced over server-sent events."""
 
     def __init__(self):
         self.cond = threading.Condition()
@@ -1083,22 +1585,14 @@ class Overlay:
         return True
 
 
-def overlay_payload(out_dir, info="", crop="full", trim=(0.0, 0.0)):
-    """(header, bytes) for a saved clip: frames in time order, cams stacked,
-    cropped horizontally (see CROPS) and trimmed by (front, back) fractions."""
-    with open(os.path.join(out_dir, "meta.json")) as fh:
-        meta = trim_clip(json.load(fh), *trim)
-    w, h, cams = meta["w"], meta["h"], meta.get("cams", [0, 1])
-    x0, x1 = crop_columns(w, crop)
-    parts = []
-    for b in meta["idxs"]:
-        for cam in cams:
-            with open(os.path.join(out_dir, f"cam{cam}_{b:03d}.pgm"), "rb") as fh:
-                parts.append(crop_frame(fh.read()[-w * h:], w, h, x0, x1))
-    header = {"w": x1 - x0, "h": h * len(cams), "n": len(meta["idxs"]),
-              "impact": meta["idxs"].index(meta["impact"]) if meta.get("impact") in meta["idxs"] else 0,
+def overlay_payload(out_dir, info=""):
+    """(header, bytes) for a saved shot as displayed (see display_segments):
+    each segment's frames in play order, segments one after another."""
+    segs = display_segments(out_dir)
+    header = {"segments": [{"board": s["board"], "w": s["w"], "h": s["h"], "n": len(s["frames"]),
+                            "impact": s["impact"] or 0} for s in segs],
               "info": info, "name": os.path.basename(out_dir)}
-    return header, b"".join(parts)
+    return header, b"".join(b"".join(s["frames"]) for s in segs)
 
 
 def serve_overlay(ov, port):
@@ -1159,44 +1653,39 @@ def serve_overlay(ov, port):
 
 
 def obs(cams, pad, port):
-    """Headless shot loop feeding an OBS browser-source overlay."""
-    lay = device_layout()
+    """Headless capture from the connected boards, feeding an OBS browser-source overlay."""
     ov = Overlay()
     serve_overlay(ov, port)
+    if DISPLAY_DENOISE:
+        warm_up_pool()
     try:  # last saved shot, so /replay works for positioning before any new shot
-        ov.publish(*overlay_payload(latest_capture(), crop=DISPLAY_CROP,
-                                    trim=(DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)), announce=False)
+        ov.publish(*overlay_payload(latest_capture()), announce=False)
     except (SystemExit, OSError, ValueError, KeyError):
         pass
     url = f"http://localhost:{port}/"
-    crop_w = (lambda x0, x1: x1 - x0)(*crop_columns(lay["w"], DISPLAY_CROP))
     print(f"OBS overlay: add a Browser Source with URL {url}\n"
-          f"  size {crop_w}x{lay['h'] * len(cams)} (or any size with that aspect ratio; "
-          f"--crop {DISPLAY_CROP})\n"
-          f"  options: {url}?fps=30&loops=2&gain=1.5&info=1\n"
+          f"  size 1280x384 or 640x192 (10:3; with --crop full on the launch camera, 20:3)\n"
+          f"  options: {url}?fps=30&fps2=10&loops=2&gain=1.5&info=1\n"
           f"  re-show the last shot (for positioning): {url}replay\n"
           f"Ctrl+C to stop.", flush=True)
-    current = {"cap": None, "stop": False}
+    stop = threading.Event()
 
     def emit(kind, *a):
         if kind == "status":
             print(a[0], flush=True)
         else:
             out_dir, summary, t_shot, info = a
-            ov.publish(*overlay_payload(out_dir, info, crop=DISPLAY_CROP,
-                                        trim=(DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK)))
+            ov.publish(*overlay_payload(out_dir, info))
             print(f"{summary}; on overlay {time.time() - t_shot:.1f}s after shot", flush=True)
             if info:
                 print(info, flush=True)
 
     try:
-        shot_loop(lay, cams, pad, emit, current)
+        shot_manager(cams, pad, emit, stop)
     except KeyboardInterrupt:
         pass
     finally:
-        current["stop"] = True
-        if current["cap"]:
-            current["cap"].cancel()
+        stop.set()
 
 
 # ---------------------------------------------------------------- main
@@ -1411,6 +1900,8 @@ def self_update(force=False):
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()   # denoise worker processes inside the packaged exe
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
                                     "impact", "version", "update"])
@@ -1429,9 +1920,15 @@ def main():
     ap.add_argument("--trim-back", type=float, default=0.2, metavar="FRACTION",
                     help="drop this fraction of each clip's end in the overlay and viewers, "
                          "where the ball is rolling away (default 0.2; 0 shows all)")
-    ap.add_argument("--crop", choices=list(CROPS), default="left",
-                    help="part of the frame shown in the OBS overlay and viewers (default left; "
-                         "saved clips keep the full frame)")
+    ap.add_argument("--crop", choices=list(CROPS), default="ball",
+                    help="what the OBS overlay and viewers show: ball = a 640x192 window that "
+                         "follows the ball on both cameras (default); left/right/full = fixed parts "
+                         "of the launch camera's frame. Saved clips keep the full frame")
+    ap.add_argument("--no-denoise", action="store_true",
+                    help="show the launch camera's frames as captured, without the "
+                         "frame-averaging denoise")
+    ap.add_argument("--board", choices=list(BOARD_MODE),
+                    help="grab/sample: which board when both are connected (default r1)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
     ap.add_argument("--no-update-check", action="store_true",
                     help="don't check GitHub for a newer release (exe only; also "
@@ -1454,9 +1951,10 @@ def main():
 
 
 def run(a):
-    global ADB, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK
+    global ADB, SERIAL, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK, DISPLAY_DENOISE
     DISPLAY_CROP = a.crop
     DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK = a.trim_front, a.trim_back
+    DISPLAY_DENOISE = not a.no_denoise
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":
@@ -1474,6 +1972,10 @@ def run(a):
         return None if a.no_view else view(d)
     if a.cmd == "status":
         return status()
+    boards = connected_boards()   # grab/sample talk to a single board
+    if a.board and a.board not in boards:
+        sys.exit(f"{a.board} isn't connected (connected: {', '.join(boards) or 'none'})")
+    SERIAL = boards.get(a.board) or boards.get("r1") or next(iter(boards.values()), None)
     cams = cam_map[a.cam or "both"]
     nbuf = device_layout()["nbuf"]
     lo, hi = (int(x) for x in a.range.split(":")) if a.range else (0, nbuf)
