@@ -362,6 +362,28 @@ class BallCrop(unittest.TestCase):
             self.assertLessEqual(abs(got - want), 2, xs)        # block-level precision
 
 
+    def crop_centres(self, mode):
+        """Where display_segments centres the window in each frame, for a ball the
+        tracker saw moving right."""
+        from unittest import mock
+        seg = {"board": "r2", "cams": [0], "w": W, "h": H, "fps": 250.0,
+               "idxs": [0, 1, 2], "impact": 1, "frames": {0: [bytes(W * H)] * 3}}
+        centres = []
+        with mock.patch.object(si, "load_shot", return_value=[seg]), \
+                mock.patch.object(si, "ball_path", return_value=[(400, 120), (450, 118), (520, 115)]), \
+                mock.patch.object(si, "crop_window",
+                                  side_effect=lambda f, w, h, x, y, cw, ch: centres.append((x, y)) or f), \
+                mock.patch.object(si, "DISPLAY_CROP", mode):
+            si.display_segments("shot")
+        return centres
+
+    def test_default_crop_is_centred_on_the_start_and_holds_still(self):
+        self.assertEqual(self.crop_centres("ball"), [(400, 120)] * 3)
+
+    def test_follow_crop_pans_with_the_ball(self):
+        self.assertEqual(self.crop_centres("follow"), [(400, 120), (450, 118), (520, 115)])
+
+
 class TrimClip(unittest.TestCase):
     def clip_meta(self, n=61, contact=30):
         idxs = [(200 + i) % 256 for i in range(n)]   # wraps around the ring

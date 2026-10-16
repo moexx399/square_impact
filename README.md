@@ -67,7 +67,8 @@ and `adb` (`winget install Google.PlatformTools`).
    ```
    In OBS add a **Browser Source** with URL `http://localhost:8765/` and size
    **640×192** (or any 10:3 size). Both cameras are shown through a 640×192
-   window that **follows the ball**, keeping it in the middle (see `--crop`).
+   window **centred on the ball** where it sits at the start of the clip, which
+   then holds still while the club and ball move through it (see `--crop`).
    Open `http://localhost:8765/replay` in any browser to re-show the last shot
    while you position it.
 
@@ -125,10 +126,11 @@ square_impact.exe update [--force]                 replace the exe with the late
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
-  --crop ball|left|right|full
+  --crop ball|follow|left|right|full
                           what the overlay and viewers show (default ball: a 640x192
-                          window following the ball on both boards; saved clips
-                          always keep the full frame)
+                          window centred on the ball at the start of the clip, then
+                          held still; follow: the same window panning with the
+                          ball; saved clips always keep the full frame)
   --no-denoise            show the launch camera's frames as captured (by default
                           its sensor grain is averaged out, see below)
   --board r1|r2           grab/sample: which board when both are connected
@@ -153,11 +155,13 @@ the frames around it, where it isn't changing**: the still floor gets smoothed
 sharp. It runs across several CPU cores (~0.3 s per shot). `--no-denoise`
 turns it off. The spin camera's strobe-lit frames are clean already.
 
-The **ball-following crop** finds the ball in every frame (a bright, roughly
-round blob, so club shafts, the club's marker and floor reflections are ignored)
-and centres a 640×192 window on it. Near the edge of a camera's view the window
-extends into black so the ball stays centred; once the ball has left the view,
-the window stays where it was last seen.
+The **ball crop** finds the ball (a bright, roughly round blob, so club shafts,
+the club's marker and floor reflections are ignored) and centres a 640×192
+window on where it is at the start of the clip. The window then stays put, so
+you see the club come in and the ball leave. Near the edge of a camera's view
+the window extends into black so the ball still starts in the middle.
+`--crop follow` instead re-centres the window on the ball in every frame; once
+the ball has left the view, it stays where the ball was last seen.
 
 ### Updates
 

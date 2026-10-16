@@ -745,9 +745,12 @@ def write_sheets(out_dir):
 # ---------------------------------------------------------------- image output
 
 # Crop for display (OBS overlay, viewers); saved clips stay full-frame.
-# "ball" (default): a BALL_CROP window that follows the ball on both cameras;
+# "ball" (default): a BALL_CROP window centred on where the ball is at the start
+# of the clip, then held still, so the club and ball move through it;
+# "follow": the same window panning to keep the ball in the middle of every frame;
 # the others are fixed horizontal slices of the launch camera's frame.
-CROPS = {"ball": (0.0, 1.0), "full": (0.0, 1.0), "left": (0.0, 0.5), "right": (0.5, 1.0)}
+CROPS = {"ball": (0.0, 1.0), "follow": (0.0, 1.0), "full": (0.0, 1.0),
+         "left": (0.0, 0.5), "right": (0.5, 1.0)}
 DISPLAY_CROP = "ball"  # set from --crop
 BALL_CROP = (640, 192)  # 10:3 on both boards, so the OBS source never changes size
 # The start of a clip is mostly the club still on its way in, and the end the
@@ -1212,8 +1215,9 @@ def _denoise_span(frames, first, count, radius, thr):
 
 def display_segments(shot_dir):
     """A saved shot as shown in the overlay and viewers: per board segment, the
-    frames trimmed (r1), denoised (r1), cropped (--crop; by default a window
-    that follows the ball) and with cameras stacked. Saved files are never changed."""
+    frames trimmed (r1), denoised (r1), cropped (--crop; by default a still
+    window centred on the ball's starting position) and with cameras stacked.
+    Saved files are never changed."""
     out = []
     for s in load_shot(shot_dir):
         idxs = s["idxs"]
@@ -1224,17 +1228,19 @@ def display_segments(shot_dir):
             lo = idxs.index(t["idxs"][0])
             hi = lo + len(t["idxs"])
         w, h = s["w"], s["h"]
-        follow = DISPLAY_CROP == "ball" and "impact" in s   # raw grab/sample captures stay whole
+        on_ball = DISPLAY_CROP in ("ball", "follow") and "impact" in s   # raw grab/sample stay whole
         per_cam = []
         for cam in s["cams"]:
             raw = s["frames"][cam][lo:hi]
             frames = denoise(raw) if r1 and DISPLAY_DENOISE else raw   # before cropping: needs aligned frames
-            if follow:
+            if on_ball:
                 cw, ch = BALL_CROP
                 path = ball_path(raw, w, h, s["board"])
+                if DISPLAY_CROP == "ball":
+                    path = [path[0]] * len(path)   # where the clip starts, then hold still
                 frames = [crop_window(f, w, h, x, y, cw, ch) for f, (x, y) in zip(frames, path)]
             else:
-                x0, x1 = crop_columns(w, DISPLAY_CROP if r1 and DISPLAY_CROP != "ball" else "full")
+                x0, x1 = crop_columns(w, DISPLAY_CROP if r1 and not on_ball else "full")
                 cw, ch = x1 - x0, h
                 frames = [crop_frame(f, w, h, x0, x1) for f in frames]
             per_cam.append(frames)
@@ -1901,7 +1907,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
@@ -2193,8 +2199,9 @@ def main():
                     help="drop this fraction of each clip's end in the overlay and viewers, "
                          "where the ball is rolling away (default 0.2; 0 shows all)")
     ap.add_argument("--crop", choices=list(CROPS), default="ball",
-                    help="what the OBS overlay and viewers show: ball = a 640x192 window that "
-                         "follows the ball on both cameras (default); left/right/full = fixed parts "
+                    help="what the OBS overlay and viewers show: ball = a 640x192 window centred "
+                         "on the ball at the start of the clip, then held still (default); follow = "
+                         "the same window panning with the ball; left/right/full = fixed parts "
                          "of the launch camera's frame. Saved clips keep the full frame")
     ap.add_argument("--no-denoise", action="store_true",
                     help="show the launch camera's frames as captured, without the "

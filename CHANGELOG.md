@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.10.0 - 2026-10-16
+### Changed
+* The ball crop (the default) now centres on the ball where it starts and then holds still, so the club and ball move through the frame; --crop follow keeps the old window that pans with the ball
+### Fixed
+* Console colour is only used when the terminal can show it: NO_COLOR and TERM=dumb now turn off all colour, and consoles that can't process colour codes get plain text instead of raw codes
+
 ## v0.9.0 - 2026-10-12
 ### Added
 * The console header now shows the logo beside the title (on terminals with colour; plain text when output is redirected or NO_COLOR is set)

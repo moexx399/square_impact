@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Console colour is only used when the terminal can show it: NO_COLOR and TERM=dumb now turn off all colour, and consoles that can''t process colour codes get plain text instead of raw codes'
-time: 2026-10-12T15:12:13.7642411-05:00
