@@ -86,6 +86,27 @@ class ContactDetection(unittest.TestCase):
         t, _, _ = si.find_impact_ordered(shot_frames(contact=40, speed=3), W, H)
         self.assertEqual(t, 40)
 
+    def fast_shot(self, launch, speed=100, n=50):
+        """Full swing: the ball leaves its rest spot at time `launch` (in frames,
+        between two frames) and flies right `speed` px per frame."""
+        return [frame(t, (round(REST[0] + max(0.0, t - launch) * speed), REST[1])) for t in range(n)]
+
+    def test_fast_ball_contact_is_the_frame_nearest_launch(self):
+        # launched late in the 2 ms between frames 35 and 36: by frame 36 the club
+        # has met the ball, so 36 is nearer contact than 35 (ball still waiting)
+        t, _, _ = si.find_impact_ordered(self.fast_shot(35.8), W, H)
+        self.assertEqual(t, 36)
+        # launched early in that gap: frame 35 is nearer
+        t, _, _ = si.find_impact_ordered(self.fast_shot(35.2), W, H)
+        self.assertEqual(t, 35)
+
+    def test_ball_faster_than_the_tracking_window_is_not_seen_late(self):
+        # 30 px/frame jumps out of the centroid window; this used to be detected
+        # two frames late
+        for launch, want in ((35.0, 35), (35.5, 35), (35.7, 36)):
+            t, _, _ = si.find_impact_ordered(self.fast_shot(launch, speed=30), W, H)
+            self.assertEqual(t, want, launch)
+
     def test_ball_that_never_moves(self):
         frames = [frame(t) for t in range(40)]
         t, _, contrast = si.find_impact_ordered(frames, W, H)
@@ -245,6 +266,7 @@ class Files(unittest.TestCase):
               "idxs": [10, 11, 12], "impact": 11, "offset_ms": [-4.0, 0.0, 4.0],
               "frames": {0: [bytes(range(8)), bytes(range(8, 16)), bytes(range(16, 24))]}}
         with mock.patch.object(si, "DISPLAY_DENOISE", False), \
+                mock.patch.object(si, "DISPLAY_ENHANCE", False), \
                 mock.patch.object(si, "DISPLAY_CROP", "left"), \
                 mock.patch.object(si, "DISPLAY_TRIM_FRONT", 0.25), \
                 mock.patch.object(si, "DISPLAY_TRIM_BACK", 0.25):
@@ -273,7 +295,8 @@ class Files(unittest.TestCase):
               "impact": 2, "frames": {0: [bytes([10]) * 12, bytes([77]) * 12, bytes([10]) * 12]}}
         r2 = {"board": "r2", "cams": [0], "w": 4, "h": 3, "fps": 250.0, "idxs": [8, 9],
               "impact": 9, "frames": {0: [bytes(12), bytes([200]) * 12]}}
-        with mock.patch.object(si, "DISPLAY_DENOISE", False):
+        with mock.patch.object(si, "DISPLAY_DENOISE", False), \
+                mock.patch.object(si, "DISPLAY_ENHANCE", False):
             d = si.save_shot([r1, r2])
             path = si.write_impact_snapshot(d)
         with open(path, "rb") as fh:
@@ -382,6 +405,34 @@ class BallCrop(unittest.TestCase):
 
     def test_follow_crop_pans_with_the_ball(self):
         self.assertEqual(self.crop_centres("follow"), [(400, 120), (450, 118), (520, 115)])
+
+
+class Enhance(unittest.TestCase):
+    def test_dark_clip_shadows_are_lifted_white_stays_white(self):
+        dark = [bytes([8] * 50 + [14] * 100 + [40] * 40 + [255] * 10) * 10]   # median 14, like r1
+        curve = si.tone_curve(dark)
+        self.assertEqual(curve[8], 0)            # black point
+        self.assertAlmostEqual(curve[14], si.TONE_MEDIAN, delta=3)
+        self.assertGreater(curve[40], 100)       # the club's dark side becomes visible
+        self.assertEqual(curve[255], 255)
+        self.assertEqual(list(curve), sorted(curve))   # monotonic: nothing swaps brightness
+
+    def test_bright_clip_is_never_darkened(self):
+        bright = [bytes([20] * 10 + [120] * 180 + [250] * 10) * 10]
+        curve = si.tone_curve(bright)
+        self.assertTrue(all(curve[v] >= v - 20 for v in range(20, 256)))   # only the black point moves
+        self.assertGreaterEqual(curve[120], 120 - 20)
+
+    def test_sharpen_crisps_edges_but_leaves_grain(self):
+        w, h = 8, 5
+        grain = bytes([20, 22, 20, 21, 19, 20, 22, 20] * h)   # +-2 levels: under the threshold
+        self.assertEqual(si.sharpen(grain, w, h), grain)
+        edge = bytes(([20] * 4 + [80] * 4) * h)               # dark | bright
+        out = si.sharpen(edge, w, h)
+        self.assertLess(out[2 * w + 3], 20)                   # dark side of the edge gets darker
+        self.assertGreater(out[2 * w + 4], 80)                # bright side brighter
+        self.assertEqual(out[2 * w + 0], 20)                  # flat areas untouched
+        self.assertEqual(out[2 * w + 7], 80)
 
 
 class TrimClip(unittest.TestCase):

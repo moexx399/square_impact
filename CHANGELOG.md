@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.11.0 - 2026-10-17
+### Added
+* Clearer launch-camera replays: the dark scene's shadows are lifted (the ball keeps its shading) and edges are sharpened without boosting grain, so the club and shaft are easier to see through the swing. --no-enhance turns it off
+### Fixed
+* The impact frame is now the frame nearest the moment of contact: the ball's flight is timed back to its launch, and fast balls are no longer tracked late. Previously it could be a frame or two before the club reached the ball
+
 ## v0.10.0 - 2026-10-16
 ### Changed
 * The ball crop (the default) now centres on the ball where it starts and then holds still, so the club and ball move through the frame; --crop follow keeps the old window that pans with the ball

@@ -383,7 +383,7 @@ def read_frames(lay, idxs, cams=(0, 1), wait_shot=False):
 #   sqp_bfind_fire_detect stop : ... idx(N) ...            cameras stopping
 #   sqp_bfind_shot_data return : 1                         accepted as a shot
 #   sim_carry input bs(..) ba(..) bd(..) srate((..) ...    its measurements
-# Contact (last frame before the ball moves) lands 4-5 frames before F, so the
+# Contact (the frame nearest the ball's launch) lands 4-5 frames before F, so the
 # window fetched around F is skewed earlier.
 FETCH_BEFORE = 40   # frames fetched before sqocam's event buffer F
 FETCH_AFTER = 30    # frames fetched after F
@@ -718,6 +718,8 @@ def write_impact_snapshot(out_dir):
             f = denoise(frames[lo:i + 4], parallel=False)[i - lo]
         else:
             f = frames[i]
+        if s["board"] == "r1" and DISPLAY_ENHANCE:   # as in the overlay and viewers
+            f = enhance([f], s["w"], s["h"], parallel=False)[0]
         rows.append((s["w"], s["h"], f))
         width = max(width, s["w"])
     if not rows:
@@ -1034,10 +1036,13 @@ def find_impact_ordered(frames, w, h):
     The ball at rest is found on the per-block minimum of the first 8 frames,
     which keeps static objects (the ball) and drops moving ones (club
     highlights). It is then tracked by its sub-pixel brightness centroid: at
-    rest that wanders < 0.5 px, once struck it moves 3+ px per frame. Contact =
-    the last frame before the ball is >= 2 px from rest and moving steadily
-    away for 3 frames. (Block-level tracking was not enough: light from the
-    approaching club shifted the ball's block by one 38 ms before contact.)"""
+    rest that wanders < 0.5 px, once struck it moves 3+ px per frame (100+ on a
+    full swing, when it's picked up again from a whole-frame search). The ball
+    has left its spot at the first frame it's >= 2 px from rest and moving
+    steadily away for 3 frames; contact_frame() then times the launch from the
+    ball's flight and returns the frame nearest it. (Block-level tracking was
+    not enough: light from the approaching club shifted the ball's block by one
+    38 ms before contact.)"""
     first = [block_means(f, w, h) for f in frames[:8]]
     floor_min = [[min(b[y][x] for b in first) for x in range(len(first[0][0]))]
                  for y in range(len(first[0]))]
@@ -1046,14 +1051,56 @@ def find_impact_ordered(frames, w, h):
 
     c = ball_centroid(frames[0], w, h, *rest_px)
     origin = c
+    away = lambda p: ((p[0] - origin[0]) ** 2 + (p[1] - origin[1]) ** 2) ** 0.5
+    rest_blob = ball_blob(frames[0], w, h, with_size=True)
     dist = []
     for f in frames:
         c = ball_centroid(f, w, h, int(c[0]), int(c[1]))
-        dist.append(((c[0] - origin[0]) ** 2 + (c[1] - origin[1]) ** 2) ** 0.5)
+        # a struck ball can jump further in one frame than the centroid window
+        # reaches; then pick it up again from a search of the whole frame
+        b = rest_blob and ball_blob(f, w, h, with_size=True)
+        if b and b[2] >= 0.5 * rest_blob[2] and away(b) > away(c) + 6:
+            c = ball_centroid(f, w, h, int(b[0]), int(b[1]))
+        dist.append(away(c))
     for t in range(1, len(frames) - 2):
         if dist[t] >= 2 and dist[t] < dist[t + 1] < dist[t + 2]:
-            return t - 1, rest_px, contrast
+            return contact_frame(frames, w, h, origin, t), rest_px, contrast
     return None, rest_px, contrast
+
+
+CONTACT_LEAD = 0.1   # frames: club-ball contact starts ~0.2 ms before the launch extrapolated from flight
+
+
+def contact_frame(frames, w, h, origin, moved):
+    """The frame nearest the moment of contact, given `moved`, the first frame
+    the ball is seen off its rest spot.
+
+    Contact falls somewhere in the 2 ms between moved-1 (ball still at rest)
+    and `moved`, and a full swing sends the ball 100+ px per frame, so neither
+    frame is reliably the closer one. The ball's flight (tracked over the whole
+    frame) is extrapolated back to its rest spot to time the launch to a
+    fraction of a frame, and the nearest frame is picked. Falls back to moved-1
+    when the flight can't be tracked."""
+    rest = ball_blob(frames[moved - 1], w, h, with_size=True)
+    pts = []
+    for t in range(moved, min(len(frames), moved + 6)):
+        b = ball_blob(frames[t], w, h, with_size=True)
+        if not b or not rest or b[2] < 0.5 * rest[2]:   # gone, or a club glint
+            continue
+        c = ball_centroid(frames[t], w, h, int(b[0]), int(b[1]))
+        d = ((c[0] - origin[0]) ** 2 + (c[1] - origin[1]) ** 2) ** 0.5
+        if pts and d <= pts[-1][1]:
+            continue   # the ball only moves away; anything else is a mistracked frame
+        pts.append((t, d))
+    if len(pts) < 2:
+        return moved - 1
+    mt = sum(p[0] for p in pts) / len(pts)
+    md = sum(p[1] for p in pts) / len(pts)
+    slope = sum((t - mt) * (d - md) for t, d in pts) / sum((t - mt) ** 2 for t, _ in pts)
+    if slope < 1:
+        return moved - 1
+    launch = mt - md / slope - CONTACT_LEAD
+    return max(moved - 2, min(moved, round(launch)))
 
 
 def ball_centroid(f, w, h, cx, cy, rw=28, rh=14):
@@ -1213,11 +1260,86 @@ def _denoise_span(frames, first, count, radius, thr):
     return out
 
 
+# The launch camera's scene is very dark (median ~14/255 on real shots; only the
+# ball and the club's edges are bright), so the club's shaft and the room barely
+# show. The overlay and viewers lift the shadows and sharpen edges.
+DISPLAY_ENHANCE = True  # set from --no-enhance
+TONE_MEDIAN = 50        # the curve puts a clip's median brightness here...
+TONE_GAMMA_MIN = 0.4    # ...but lifts no harder than this
+SHARPEN_AMOUNT = 1.2    # unsharp mask strength
+SHARPEN_THRESHOLD = 3   # grey levels: smaller differences are grain, left alone
+
+
+def tone_curve(frames):
+    """Lookup table that lifts a dark clip's shadows: from the black point (the
+    1st percentile) a gamma curve that puts the median at TONE_MEDIAN. White stays
+    white, so the ball keeps its shading rather than clipping. It never darkens:
+    a clip that's bright already (gamma would be > 1) only gets its black point
+    set."""
+    sample = sorted(v for f in frames for v in f[::97])
+    black, mid = sample[len(sample) // 100], sample[len(sample) // 2]
+    if black >= 250:
+        return bytes(range(256))
+    span = 255 - black
+    if mid - black < 1:
+        gamma = TONE_GAMMA_MIN
+    else:
+        gamma = min(1.0, max(TONE_GAMMA_MIN, math.log(TONE_MEDIAN / 255) / math.log((mid - black) / span)))
+    return bytes(round(255 * max(0.0, (v - black) / span) ** gamma) for v in range(256))
+
+
+def enhance(frames, w, h, curve=None, parallel=True):
+    """Sharpen edges, then apply the tone curve (by default the clip's own;
+    sharpening first, so its grain threshold is in the sensor's grey levels)."""
+    curve = curve or tone_curve(frames)
+    n = len(frames)
+    if parallel and n >= 8:
+        try:
+            pool = process_pool()
+            k = min(8, n)
+            bounds = [n * i // k for i in range(k + 1)]
+            jobs = [pool.submit(_sharpen_span, frames[lo:hi], w, h) for lo, hi in zip(bounds, bounds[1:])]
+            return [f.translate(curve) for j in jobs for f in j.result()]
+        except (OSError, RuntimeError):   # no worker processes available: do it here
+            pass
+    return [f.translate(curve) for f in _sharpen_span(frames, w, h)]
+
+
+def _sharpen_span(frames, w, h):
+    return [sharpen(f, w, h) for f in frames]
+
+
+def sharpen(f, w, h, amount=SHARPEN_AMOUNT, thr=SHARPEN_THRESHOLD):
+    """Unsharp mask with a threshold: each pixel is pushed away from its 3x3
+    neighbourhood mean, but only where it differs from it by more than `thr`,
+    so the club's, shaft's and ball's edges get crisper while flat areas'
+    grain isn't amplified."""
+    if w < 3 or h < 3:
+        return f
+    sums = []   # horizontal 3-pixel sums per row, edges repeated
+    for y in range(h):
+        r = f[y * w:(y + 1) * w]
+        s = [r[0] * 2 + r[1]]
+        s += [r[x - 1] + r[x] + r[x + 1] for x in range(1, w - 1)]
+        s.append(r[w - 2] + r[w - 1] * 2)
+        sums.append(s)
+    out = bytearray(f)
+    for y in range(h):
+        a, b, c = sums[max(0, y - 1)], sums[y], sums[min(h - 1, y + 1)]
+        o = y * w
+        for x in range(w):
+            v = f[o + x]
+            d = v - (a[x] + b[x] + c[x]) / 9
+            if d > thr or d < -thr:
+                out[o + x] = min(255, max(0, round(v + amount * d)))
+    return bytes(out)
+
+
 def display_segments(shot_dir):
     """A saved shot as shown in the overlay and viewers: per board segment, the
-    frames trimmed (r1), denoised (r1), cropped (--crop; by default a still
-    window centred on the ball's starting position) and with cameras stacked.
-    Saved files are never changed."""
+    frames trimmed (r1), denoised and enhanced (r1), cropped (--crop; by default
+    a still window centred on the ball's starting position) and with cameras
+    stacked. Saved files are never changed."""
     out = []
     for s in load_shot(shot_dir):
         idxs = s["idxs"]
@@ -1229,10 +1351,15 @@ def display_segments(shot_dir):
             hi = lo + len(t["idxs"])
         w, h = s["w"], s["h"]
         on_ball = DISPLAY_CROP in ("ball", "follow") and "impact" in s   # raw grab/sample stay whole
+        raws = [s["frames"][cam][lo:hi] for cam in s["cams"]]
+        # before cropping: denoise needs aligned frames, and sharpening the crop's
+        # black padding would draw a line along its edge
+        shown = [denoise(raw) if r1 and DISPLAY_DENOISE else raw for raw in raws]
+        if r1 and DISPLAY_ENHANCE:
+            curve = tone_curve([f for frames in shown for f in frames])   # one curve: cameras match
+            shown = [enhance(frames, w, h, curve) for frames in shown]
         per_cam = []
-        for cam in s["cams"]:
-            raw = s["frames"][cam][lo:hi]
-            frames = denoise(raw) if r1 and DISPLAY_DENOISE else raw   # before cropping: needs aligned frames
+        for raw, frames in zip(raws, shown):
             if on_ball:
                 cw, ch = BALL_CROP
                 path = ball_path(raw, w, h, s["board"])
@@ -1661,7 +1788,7 @@ def live(cams, pad):
         v.root.destroy()
 
     v.root.protocol("WM_DELETE_WINDOW", close)
-    if DISPLAY_DENOISE:
+    if DISPLAY_DENOISE or DISPLAY_ENHANCE:
         warm_up_pool()
     threading.Thread(target=shot_manager, args=(cams, pad, emit, stop), daemon=True).start()
     if os.path.isdir(SHOTS_DIR) and glob.glob(os.path.join(SHOTS_DIR, "*", "meta.json")):
@@ -1869,7 +1996,7 @@ def obs(cams, pad, port):
     """Headless capture from the connected boards, feeding an OBS browser-source overlay."""
     ov = Overlay()
     serve_overlay(ov, port)
-    if DISPLAY_DENOISE:
+    if DISPLAY_DENOISE or DISPLAY_ENHANCE:
         warm_up_pool()
     try:  # last saved shot, so /replay works for positioning before any new shot
         last = latest_capture()
@@ -1907,7 +2034,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
@@ -2206,6 +2333,9 @@ def main():
     ap.add_argument("--no-denoise", action="store_true",
                     help="show the launch camera's frames as captured, without the "
                          "frame-averaging denoise")
+    ap.add_argument("--no-enhance", action="store_true",
+                    help="show the launch camera's frames at their captured brightness, without "
+                         "the shadow lift and edge sharpening")
     ap.add_argument("--board", choices=list(BOARD_MODE),
                     help="grab/sample: which board when both are connected (default r1)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
@@ -2230,10 +2360,11 @@ def main():
 
 
 def run(a):
-    global ADB, SERIAL, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK, DISPLAY_DENOISE
+    global ADB, SERIAL, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK, DISPLAY_DENOISE, DISPLAY_ENHANCE
     DISPLAY_CROP = a.crop
     DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK = a.trim_front, a.trim_back
     DISPLAY_DENOISE = not a.no_denoise
+    DISPLAY_ENHANCE = not a.no_enhance
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":
