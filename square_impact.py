@@ -718,8 +718,10 @@ def write_impact_snapshot(out_dir):
             f = denoise(frames[lo:i + 4], parallel=False)[i - lo]
         else:
             f = frames[i]
-        if s["board"] == "r1" and DISPLAY_ENHANCE:   # as in the overlay and viewers
-            f = enhance([f], s["w"], s["h"], parallel=False)[0]
+        if s["board"] == "r1" and DISPLAY_ENHANCE:   # as in the overlay and viewers,
+            # with the whole clip telling what's still and what's moving
+            f = enhance([f], s["w"], s["h"], tone_curves(frames), still_background(frames),
+                        parallel=False)[0]
         rows.append((s["w"], s["h"], f))
         width = max(width, s["w"])
     if not rows:
@@ -1262,20 +1264,25 @@ def _denoise_span(frames, first, count, radius, thr):
 
 # The launch camera's scene is very dark (median ~14/255 on real shots; only the
 # ball and the club's edges are bright), so the club's shaft and the room barely
-# show. The overlay and viewers lift the shadows and sharpen edges.
+# show. The overlay and viewers lift the shadows and sharpen edges. The club
+# itself only shows as its bright edges (its dark body is as dark as the floor),
+# so lifting everything alike would bring the turf up to the club: what moves
+# gets the full lift, the still scene a gentler one.
 DISPLAY_ENHANCE = True  # set from --no-enhance
-TONE_MEDIAN = 50        # the curve puts a clip's median brightness here...
-TONE_GAMMA_MIN = 0.4    # ...but lifts no harder than this
+TONE_MEDIAN = 50        # the curve for moving things puts a clip's median brightness here,
+TONE_MEDIAN_STILL = 28  # the one for the still scene (turf, room) here...
+TONE_GAMMA_MIN = 0.4    # ...but neither lifts harder than this
+MOTION_LO, MOTION_HI = 4, 14   # grey levels off the still background: still below, moving above
 SHARPEN_AMOUNT = 1.2    # unsharp mask strength
 SHARPEN_THRESHOLD = 3   # grey levels: smaller differences are grain, left alone
 
 
-def tone_curve(frames):
+def tone_curve(frames, median=TONE_MEDIAN):
     """Lookup table that lifts a dark clip's shadows: from the black point (the
-    1st percentile) a gamma curve that puts the median at TONE_MEDIAN. White stays
-    white, so the ball keeps its shading rather than clipping. It never darkens:
-    a clip that's bright already (gamma would be > 1) only gets its black point
-    set."""
+    1st percentile) a gamma curve that puts the clip's median at `median`. White
+    stays white, so the ball keeps its shading rather than clipping. It never
+    darkens: a clip that's bright already (gamma would be > 1) only gets its
+    black point set."""
     sample = sorted(v for f in frames for v in f[::97])
     black, mid = sample[len(sample) // 100], sample[len(sample) // 2]
     if black >= 250:
@@ -1284,29 +1291,64 @@ def tone_curve(frames):
     if mid - black < 1:
         gamma = TONE_GAMMA_MIN
     else:
-        gamma = min(1.0, max(TONE_GAMMA_MIN, math.log(TONE_MEDIAN / 255) / math.log((mid - black) / span)))
+        gamma = min(1.0, max(TONE_GAMMA_MIN, math.log(median / 255) / math.log((mid - black) / span)))
     return bytes(round(255 * max(0.0, (v - black) / span) ** gamma) for v in range(256))
 
 
-def enhance(frames, w, h, curve=None, parallel=True):
-    """Sharpen edges, then apply the tone curve (by default the clip's own;
-    sharpening first, so its grain threshold is in the sensor's grey levels)."""
-    curve = curve or tone_curve(frames)
+def tone_curves(frames):
+    """(still, moving) lookup tables for a clip: see TONE_MEDIAN_STILL."""
+    return tone_curve(frames, TONE_MEDIAN_STILL), tone_curve(frames, TONE_MEDIAN)
+
+
+def still_background(frames):
+    """Per-pixel median over a clip: the scene with the club and the flying
+    ball gone (each is at any one spot for only a few frames)."""
     n = len(frames)
+    return bytes(sorted(px)[n // 2] for px in zip(*frames))
+
+
+def enhance(frames, w, h, curves=None, background=None, parallel=True):
+    """Sharpen edges, then apply the tone curves: each pixel gets the still
+    curve where it matches the clip's still background and the moving one where
+    it differs by MOTION_HI or more, blended between. (Sharpening first, so its
+    grain threshold is in the sensor's grey levels.) `background` defaults to
+    the clip's own; without one (fewer than 3 frames) everything counts as moving."""
+    still, moving = curves or tone_curves(frames)
+    n = len(frames)
+    if background is None and n >= 3:
+        background = still_background(frames)
     if parallel and n >= 8:
         try:
             pool = process_pool()
             k = min(8, n)
             bounds = [n * i // k for i in range(k + 1)]
-            jobs = [pool.submit(_sharpen_span, frames[lo:hi], w, h) for lo, hi in zip(bounds, bounds[1:])]
-            return [f.translate(curve) for j in jobs for f in j.result()]
+            jobs = [pool.submit(_enhance_span, frames[lo:hi], w, h, background, still, moving)
+                    for lo, hi in zip(bounds, bounds[1:])]
+            return [f for j in jobs for f in j.result()]
         except (OSError, RuntimeError):   # no worker processes available: do it here
             pass
-    return [f.translate(curve) for f in _sharpen_span(frames, w, h)]
+    return _enhance_span(frames, w, h, background, still, moving)
 
 
-def _sharpen_span(frames, w, h):
-    return [sharpen(f, w, h) for f in frames]
+def _enhance_span(frames, w, h, background, still, moving):
+    out = []
+    for f in frames:
+        s = sharpen(f, w, h)
+        if background is None:
+            out.append(s.translate(moving))
+            continue
+        o = bytearray(len(s))
+        span = MOTION_HI - MOTION_LO
+        for i, (v, raw, b) in enumerate(zip(s, f, background)):
+            d = raw - b if raw > b else b - raw   # motion judged on the unsharpened pixel
+            if d <= MOTION_LO:
+                o[i] = still[v]
+            elif d >= MOTION_HI:
+                o[i] = moving[v]
+            else:
+                o[i] = still[v] + (moving[v] - still[v]) * (d - MOTION_LO) // span
+        out.append(bytes(o))
+    return out
 
 
 def sharpen(f, w, h, amount=SHARPEN_AMOUNT, thr=SHARPEN_THRESHOLD):
@@ -1356,8 +1398,8 @@ def display_segments(shot_dir):
         # black padding would draw a line along its edge
         shown = [denoise(raw) if r1 and DISPLAY_DENOISE else raw for raw in raws]
         if r1 and DISPLAY_ENHANCE:
-            curve = tone_curve([f for frames in shown for f in frames])   # one curve: cameras match
-            shown = [enhance(frames, w, h, curve) for frames in shown]
+            curves = tone_curves([f for frames in shown for f in frames])   # one pair: cameras match
+            shown = [enhance(frames, w, h, curves) for frames in shown]
         per_cam = []
         for raw, frames in zip(raws, shown):
             if on_ball:
@@ -1824,6 +1866,7 @@ const P = new URLSearchParams(location.search);
 const FPS = +P.get('fps') || 30, FPS2 = +P.get('fps2') || 10, LOOPS = +P.get('loops') || 2,
       GAP = +(P.get('gap') ?? 250), FADE = +P.get('fade') || 300, GAIN = +P.get('gain') || 1,
       INFO = P.get('info') === '1', HOLD = +(P.get('hold') ?? 700);
+const QUIET_MS = 15000;   // no event or ping for this long (pings come every 5 s): reconnect
 document.documentElement.style.setProperty('--fade', FADE + 'ms');
 const wrap = document.getElementById('wrap'), cv = document.getElementById('c'),
       ctx = cv.getContext('2d'), infoEl = document.getElementById('info');
@@ -1834,7 +1877,12 @@ let token = 0;
 
 async function show(s) {
   const my = ++token;
-  const buf = new Uint8Array(await (await fetch('/shot/' + s.id + '.bin')).arrayBuffer());
+  let buf;
+  try {
+    const r = await fetch('/shot/' + s.id + '.bin', { cache: 'no-store' });
+    if (!r.ok) return;                           // replaced by a newer shot already
+    buf = new Uint8Array(await r.arrayBuffer());
+  } catch (err) { return; }                      // square_impact went away; the next shot will play
   if (my !== token) return;                      // a newer shot arrived meanwhile
   // One timeline over all segments: the launch camera's swing, then the spin
   // camera's close-up (each with its own size and playback speed).
@@ -1876,10 +1924,29 @@ async function show(s) {
   }, 8);
 }
 
-const es = new EventSource('/events');
-es.onmessage = e => show(JSON.parse(e.data));
+// New shots arrive over server-sent events. The browser reconnects by itself
+// after most drops, but not all (an error reply while square_impact restarts
+// closes the stream for good, and a stalled connection never errors), so a
+// watchdog reopens it when it's closed or has gone quiet: the server sends a
+// ping every few seconds.
+let es = null, heard = 0;
+function connect() {
+  if (es) es.close();
+  heard = performance.now();
+  es = new EventSource('/events');
+  es.onopen = () => { heard = performance.now(); };
+  es.addEventListener('ping', () => { heard = performance.now(); });
+  es.onmessage = e => { heard = performance.now(); show(JSON.parse(e.data)); };
+}
+connect();
+setInterval(() => {
+  if (es.readyState === EventSource.CLOSED || performance.now() - heard > QUIET_MS) connect();
+}, 2000);
 </script></body></html>
 """
+
+
+OVERLAY_PING = 5   # seconds between keep-alive pings on /events (the page reconnects after 15 s without)
 
 
 class Overlay:
@@ -1973,13 +2040,16 @@ def serve_overlay(ov, port):
                 with ov.cond:
                     seen = ov.seq  # don't replay the last shot when OBS (re)loads the page
                 try:
+                    self.wfile.write(b"retry: 2000\n\n")   # browser's reconnect delay after a drop
+                    self.wfile.flush()
                     while True:
                         with ov.cond:
-                            ov.cond.wait_for(lambda s=seen: ov.seq != s, timeout=15)
+                            ov.cond.wait_for(lambda s=seen: ov.seq != s, timeout=OVERLAY_PING)
                             fresh = ov.seq != seen
                             seen = ov.seq
                             header = ov.shots[seen][0] if fresh else None
-                        msg = f"data: {json.dumps(header)}\n\n" if fresh else ": ping\n\n"
+                        # a named event, not an SSE comment: the page's watchdog has to see it
+                        msg = f"data: {json.dumps(header)}\n\n" if fresh else "event: ping\ndata: \n\n"
                         self.wfile.write(msg.encode())
                         self.wfile.flush()
                 except OSError:
@@ -2034,7 +2104,7 @@ def obs(cams, pad, port):
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

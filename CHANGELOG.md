@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.12.0 - 2026-10-19
+### Changed
+* The club stands out from the turf again in enhanced replays: moving things get the full shadow lift and the still turf and room a gentler one (the club is ~3.7x brighter than the turf behind it, up from ~2.3x)
+
 ## v0.11.0 - 2026-10-17
 ### Added
 * Clearer launch-camera replays: the dark scene's shadows are lifted (the ball keeps its shading) and edges are sharpened without boosting grain, so the club and shaft are easier to see through the swing. --no-enhance turns it off

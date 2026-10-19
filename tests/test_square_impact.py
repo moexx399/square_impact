@@ -423,6 +423,27 @@ class Enhance(unittest.TestCase):
         self.assertTrue(all(curve[v] >= v - 20 for v in range(20, 256)))   # only the black point moves
         self.assertGreaterEqual(curve[120], 120 - 20)
 
+    def test_moving_club_is_lifted_more_than_the_still_turf(self):
+        w, h, n = 400, 3, 9
+        turf = bytes([8, 10, 12, 14, 14, 16, 18, 20] * (w * h // 8))   # dark, median 14 like r1's floor
+        frames = [turf] * n
+        club = bytearray(turf)
+        club[w + 3] = 60                       # one bright club edge passing over a 14
+        frames[4] = bytes(club)
+        still, moving = si.tone_curves(frames)
+        self.assertLess(still[14], moving[14])
+        out = si.enhance(frames, w, h, parallel=False)[4]
+        flat = si.sharpen(turf, w, h)
+        self.assertEqual(out[w], still[flat[w]])     # turf: the gentle curve
+        self.assertEqual(out[w + 3], moving[si.sharpen(frames[4], w, h)[w + 3]])   # club: the full lift
+        self.assertGreater(out[w + 3] / max(1, out[w + 4]), moving[60] / moving[14])   # stands out more
+
+    def test_single_frame_without_background_counts_as_moving(self):
+        f = bytes([8, 14, 40, 255] * 6)
+        curves = si.tone_curves([f])
+        self.assertEqual(si.enhance([f], 4, 6, curves, parallel=False)[0],
+                         si.sharpen(f, 4, 6).translate(curves[1]))
+
     def test_sharpen_crisps_edges_but_leaves_grain(self):
         w, h = 8, 5
         grain = bytes([20, 22, 20, 21, 19, 20, 22, 20] * h)   # +-2 levels: under the threshold

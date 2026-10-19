@@ -161,13 +161,18 @@ turns it off. The spin camera's strobe-lit frames are clean already.
 The launch camera's scene is also **very dark**: half the pixels sit at 14/255
 or below, and only the ball and the club's edges are bright, so the shaft, the
 club and the room barely show. After denoising, the overlay and viewers
-**lift the shadows**: a tone curve sets the clip's black point and puts its
-median brightness at 50/255, easing into the highlights so the ball keeps its
-shading instead of clipping. A clip that's bright already isn't darkened.
-They then **sharpen edges**: each pixel is pushed away from its neighbours'
+**lift the shadows**: a tone curve sets the clip's black point and eases into
+the highlights, so the ball keeps its shading instead of clipping. The lift is
+**motion-aware**. The club only shows as its bright edges (its dark body is as
+dark as the turf), so lifting everything alike would bring the turf up to the
+club. So whatever moves, compared with the clip's still background, gets the
+full lift (the clip's median brightness at 50/255), while the still turf and room
+get a gentler one (28/255): visible, but well below the club. A clip that's
+bright already isn't darkened.
+They also **sharpen edges**: each pixel is pushed away from its neighbours'
 average, but only where it differs from them by more than 3 grey levels, so the
 club, shaft and ball get crisper while the floor's grain is left alone. This
-adds ~0.3 s per shot; `--no-enhance` turns it off. `impact.png` gets the same
+adds ~0.8 s per shot; `--no-enhance` turns it off. `impact.png` gets the same
 treatment. The spin camera is left as captured.
 
 The **ball crop** finds the ball (a bright, roughly round blob, so club shafts,
