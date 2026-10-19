@@ -105,6 +105,14 @@ Add these to the Browser Source URL, e.g. `http://localhost:8765/?gain=1.5&info=
 The page is transparent while idle. Reloading it in OBS doesn't replay old shots.
 If a new shot arrives mid-playback, it replaces the current one.
 
+**Start square_impact before OBS.** If OBS loads the Browser Source while
+square_impact isn't running yet, OBS shows its own connection-error page, which
+never retries: the replay stays blank until you refresh the source. If a script
+starts both, start `square_impact obs` first and wait until something is
+listening on port 8765. Once the page has loaded, it looks after itself: if
+square_impact restarts or updates while OBS stays open, the page reconnects
+within a few seconds and the next shot plays.
+
 **Impact snapshot.** `http://localhost:8765/impact.png` always serves a still of
 the latest shot's moment of impact (see [Output](#output)). Use it in a second
 Browser Source if you want the still on screen next to the replay.

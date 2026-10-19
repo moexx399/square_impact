@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.12.1 - 2026-10-19
+### Fixed
+* The OBS replay no longer needs a cache refresh after square_impact restarts or updates: the page reconnects by itself (keep-alive pings every 5 s, reconnect after 15 s of silence). The README explains starting square_impact before OBS
+
 ## v0.12.0 - 2026-10-19
 ### Changed
 * The club stands out from the turf again in enhanced replays: moving things get the full shadow lift and the still turf and room a gentler one (the club is ~3.7x brighter than the turf behind it, up from ~2.3x)

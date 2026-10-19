@@ -785,6 +785,23 @@ class Logo(unittest.TestCase):
         self.assertNotIn("\033", buf.getvalue())
         self.assertNotIn("▀", buf.getvalue())
 
+    def test_overlay_events_send_pings_the_page_can_see(self):
+        """The page's watchdog reconnects after 15 s of silence, so /events must
+        send named ping events (SSE comments never reach the page's script)."""
+        import urllib.request
+        from unittest import mock
+        with mock.patch.object(si, "OVERLAY_PING", 0.2):
+            srv = si.serve_overlay(si.Overlay(), 0)
+            try:
+                url = f"http://127.0.0.1:{srv.server_address[1]}/events"
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    lines = [r.readline() for _ in range(5)]
+            finally:
+                srv.shutdown()
+                srv.server_close()
+        self.assertEqual(lines[0], b"retry: 2000\n")
+        self.assertIn(b"event: ping\n", lines)
+
     def test_overlay_serves_favicon(self):
         import urllib.request
         srv = si.serve_overlay(si.Overlay(), 0)   # port 0: any free port
