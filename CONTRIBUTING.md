@@ -31,9 +31,12 @@ python -m unittest discover -s tests -v   # offline tests, no device needed
 pip install ruff && ruff check .          # lint (config in pyproject.toml)
 ```
 
-To run it against hardware you need Windows, Python 3.10+,
-`adb` (`winget install Google.PlatformTools`) and a Square Omni connected by
-USB. Start with `python square_impact.py status`.
+To run it against hardware you need Python 3.10+, `adb` (Windows:
+`winget install Google.PlatformTools`; macOS: `brew install android-platform-tools`;
+Linux: your distribution's `adb` package plus the udev rule in the README) and a
+Square Omni connected by USB. Start with `python square_impact.py status`.
+Windows is where it's been tested most; reports from macOS and Linux are
+especially welcome.
 
 You'll also want [changie](https://changie.dev) for changelog entries:
 `winget install miniscruff.changie` (or `brew install changie`, or
@@ -75,6 +78,12 @@ Most of the code can be developed and tested offline:
 - Match the surrounding code: small functions, comments that explain *why*
   (device quirks, timing), not what.
 - Line length 110. `ruff check .` must pass.
+- Anything a user might want to tune belongs in `SETTINGS` in `square_impact.py`
+  (key, group, type, default, limits, help text, when it takes effect). It then
+  shows up on the settings page and can be set in `square_impact.json`
+  automatically. Read the setting where it's used, not as a default argument,
+  and pass it explicitly to worker processes: they don't see the main process's
+  settings.
 - Device facts (memory addresses, log lines, timings) are documented in
   [docs/DEVICE_NOTES.md](docs/DEVICE_NOTES.md). Update it if you find out
   something new.

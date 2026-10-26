@@ -456,6 +456,195 @@ class Enhance(unittest.TestCase):
         self.assertEqual(out[2 * w + 7], 80)
 
 
+class Settings(unittest.TestCase):
+    """square_impact.json next to the app overrides the defaults; the command
+    line overrides the file; the settings page saves to the file."""
+
+    def setUp(self):
+        from unittest import mock
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "square_impact.json")
+        self.saved = {s["attr"]: getattr(si, s["attr"]) for s in si.SETTINGS if s["attr"]}
+        self.patches = [mock.patch.object(si, "CONFIG_PATH", self.path),
+                        mock.patch.dict(si.CONFIG, {"file": {}, "cli": {}, "warnings": []})]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        for attr, v in self.saved.items():   # settings are module globals: put them back
+            setattr(si, attr, v)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, obj):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_schema_defaults_match_the_code(self):
+        for s in si.SETTINGS:
+            if s["attr"]:
+                self.assertEqual(s["default"], self.saved[s["attr"]], s["key"])
+            si.coerce_setting(s["key"], s["default"])   # every default passes its own limits
+
+    def test_file_overrides_defaults_and_command_line_overrides_file(self):
+        self.write({"crop": "full", "pad": 20, "sharpen_amount": 0.5})
+        self.assertEqual(si.load_settings({"pad": 25}), [])
+        self.assertEqual((si.DISPLAY_CROP, si.CAPTURE_PAD, si.SHARPEN_AMOUNT), ("full", 25, 0.5))
+        self.assertEqual(si.setting("trim_front"), 0.2)   # untouched: the default
+
+    def test_bad_entries_are_reported_and_ignored(self):
+        self.write({"pad": "lots", "crop": "sideways", "tone_median": 999, "colour": "red", "denoise": False})
+        warnings = si.load_settings()
+        self.assertEqual(len(warnings), 4)
+        self.assertEqual(si.CAPTURE_PAD, 30)
+        self.assertFalse(si.DISPLAY_DENOISE)               # the valid one still applies
+        self.write("{ not json")
+        self.assertEqual(len(si.load_settings()), 1)
+        self.assertTrue(si.DISPLAY_DENOISE)
+
+    def test_save_validates_then_writes_and_applies(self):
+        self.write({"comment": "kept", "pad": 20})
+        self.assertIn("pad", si.save_settings({"pad": 500, "crop": "full"}))   # nothing written
+        self.assertEqual(self.read(), {"comment": "kept", "pad": 20})
+        self.assertEqual(si.save_settings({"pad": None, "crop": "full", "gain": "1.5"}), {})
+        self.assertEqual(self.read(), {"comment": "kept", "crop": "full", "gain": 1.5})
+        self.assertEqual(si.DISPLAY_CROP, "full")
+        self.assertEqual(si.page_config()["gain"], 1.5)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_settings_page_and_api(self):
+        import urllib.error
+        import urllib.request
+        ov = si.Overlay()
+        srv = si.serve_overlay(ov, 0)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"   # (localhost tries IPv6 first: slow on Windows)
+
+        def post(body, ctype="application/json", origin=None, host=None):
+            req = urllib.request.Request(base + "/api/settings", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": ctype}, method="POST")
+            if origin:
+                req.add_header("Origin", origin)
+            if host:
+                req.add_header("Host", host)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, json.loads(e.read())
+        try:
+            with urllib.request.urlopen(base + "/settings", timeout=5) as r:
+                self.assertIn(b"square_impact settings", r.read())
+            with urllib.request.urlopen(base + "/api/settings", timeout=5) as r:
+                state = json.loads(r.read())
+            self.assertEqual({s["key"] for s in state["settings"]}, set(si.SETTING))
+            # a form or page from another site can't change settings
+            self.assertEqual(post({"crop": "full"}, ctype="text/plain")[0], 403)
+            self.assertEqual(post({"crop": "full"}, origin="http://evil.example")[0], 403)
+            self.assertEqual(post({"crop": "full"}, host=f"evil.example:{port}")[0], 403)
+            self.assertFalse(os.path.exists(self.path))
+            self.assertEqual(post({"pad": -1})[0], 400)
+            code, state = post({"crop": "full", "fps": 12}, origin=base)
+            self.assertEqual(code, 200)
+            self.assertEqual(self.read(), {"crop": "full", "fps": 12})
+            self.assertEqual(si.DISPLAY_CROP, "full")
+            self.assertEqual(ov.config_seq, 1)               # open overlay pages reload
+            with urllib.request.urlopen(base + "/", timeout=5) as r:
+                self.assertIn(b'"fps": 12', r.read())        # the page's defaults
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class Platforms(unittest.TestCase):
+    def test_update_asset_names_match_what_the_pipeline_builds(self):
+        """`update` downloads square_impact-<release_platform()>.zip; build-exe.yml
+        must build exactly those platforms."""
+        from unittest import mock
+        wf = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "build-exe.yml")
+        with open(wf, encoding="utf-8") as fh:
+            built = set(re.findall(r"platform: ([\w-]+)", fh.read()))
+        names = set()
+        for windows, macos, machine in ((True, False, "AMD64"), (False, True, "arm64"),
+                                        (False, True, "x86_64"), (False, False, "x86_64")):
+            with mock.patch.object(si, "WINDOWS", windows), mock.patch.object(si, "MACOS", macos), \
+                    mock.patch("platform.machine", return_value=machine):
+                names.add(si.release_platform())
+        self.assertEqual(names, {"windows", "macos-arm64", "macos-x64", "linux-x64"})
+        self.assertEqual(built, names)
+
+    def test_data_dir_per_platform(self):
+        from unittest import mock
+        with mock.patch.object(si, "WINDOWS", False), mock.patch.object(si, "MACOS", True):
+            self.assertTrue(si.data_dir().endswith(os.path.join("Application Support", "square_impact")))
+        with mock.patch.object(si, "WINDOWS", False), mock.patch.object(si, "MACOS", False), \
+                mock.patch.dict(os.environ, {"XDG_DATA_HOME": "/xdg"}):
+            self.assertEqual(si.data_dir(), os.path.join("/xdg", "square_impact"))
+
+
+class SettingsInEveryMode(unittest.TestCase):
+    def test_settings_server_starts_and_tolerates_a_taken_port(self):
+        import contextlib
+        import io
+        import socket
+        import urllib.request
+        from unittest import mock
+        with socket.socket() as s:   # a free port
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        out = io.StringIO()
+        with mock.patch.object(si, "OVERLAY_PORT", port), contextlib.redirect_stdout(out):
+            si.start_settings_server()
+            si.start_settings_server()   # port now taken (as by a running obs): no crash
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/settings", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+        self.assertIn(f"localhost:{port}/settings", out.getvalue())
+        self.assertIn("already running", out.getvalue())
+
+
+class SettingsPreview(unittest.TestCase):
+    """The settings page previews a saved shot with unsaved values, without
+    changing the running settings."""
+
+    def setUp(self):
+        from unittest import mock
+        self.dir = tempfile.mkdtemp()
+        r1 = {"board": "r1", "cams": [0], "w": W, "h": H, "fps": 500.0,
+              "idxs": list(range(12)), "impact": 6,
+              "frames": {0: shot_frames(contact=6, n=12, speed=20)}}
+        self.patches = [mock.patch.object(si, "SHOTS_DIR", self.dir),
+                        mock.patch.object(si, "KEEP_CAPTURES", 50)]
+        for p in self.patches:
+            p.start()
+        self.name = os.path.basename(si.save_shot([r1], "info"))
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_preview_renders_with_unsaved_values_and_leaves_settings_alone(self):
+        self.assertEqual(si.saved_shots(), [self.name])
+        header, data = si.preview_payload(self.name, {"crop": "full", "enhance": False, "fps": 99})
+        seg = header["segments"][0]
+        self.assertEqual((seg["w"], seg["h"]), (W, H))                  # full frame, not the ball crop
+        self.assertEqual(len(data), seg["n"] * W * H)
+        self.assertEqual((si.DISPLAY_CROP, si.DISPLAY_ENHANCE), ("ball", True))   # nothing changed
+        header, _ = si.preview_payload(self.name, {"crop": None})       # None: the default
+        self.assertEqual(header["segments"][0]["w"], si.BALL_CROP[0])
+
+    def test_preview_rejects_unknown_shots_and_bad_values(self):
+        for name, edits in (("../../etc", {}), ("nope", {}), (self.name, {"crop": "sideways"})):
+            with self.assertRaises(ValueError):
+                si.preview_payload(name, edits)
+
+
 class TrimClip(unittest.TestCase):
     def clip_meta(self, n=61, contact=30):
         idxs = [(200 + i) % 256 for i in range(n)]   # wraps around the ring

@@ -1,7 +1,11 @@
-# Builds square_impact.exe: a single Windows executable with adb bundled.
-#   - every push / pull request: build + smoke test, exe uploaded as a workflow artifact
-#   - version tags (v1.2.3 or 1.2.3): also published as a GitHub Release, with notes
-#     from changie (.changes/v1.2.3.md)
+# Builds square_impact as a single executable with adb bundled, for Windows,
+# macOS (Apple Silicon and Intel) and Linux.
+#   - every push / pull request: build + smoke test on each platform, each zip
+#     uploaded as a workflow artifact
+#   - version tags (v1.2.3 or 1.2.3): also published together as one GitHub
+#     Release, with notes from changie (.changes/v1.2.3.md)
+# Asset names (square_impact-<platform>.zip) are what `square_impact update`
+# looks for: see release_platform() in square_impact.py.
 name: build-exe
 
 on:
@@ -15,8 +19,22 @@ permissions:
   contents: write   # needed to create the release on tags
 
 jobs:
-  windows-exe:
-    runs-on: windows-latest
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows, tools: windows }
+          - { os: macos-latest, platform: macos-arm64, tools: darwin }
+          - { os: macos-15-intel, platform: macos-x64, tools: darwin }
+          # the oldest supported Ubuntu: a binary built against an older glibc
+          # also runs on newer distributions, not the other way round
+          - { os: ubuntu-22.04, platform: linux-x64, tools: linux }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
 
@@ -26,59 +44,91 @@ jobs:
 
       - name: Check tag matches the version in the code
         if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag -replace '^v', ''   # the leading v is optional: v1.2.3 == 1.2.3
-          $code = (Select-String -Path square_impact.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
-          if ($version -ne $code) { Write-Error "tag $tag does not match VERSION $code (run 'changie batch' first)"; exit 1 }
+          version="${GITHUB_REF_NAME#v}"   # the leading v is optional: v1.2.3 == 1.2.3
+          code=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' square_impact.py)
+          if [ "$version" != "$code" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $code (run 'changie batch' first)"; exit 1
+          fi
           # changie always names version notes with a v prefix
-          if (-not (Test-Path ".changes/v$version.md")) { Write-Error "missing .changes/v$version.md (run 'changie batch')"; exit 1 }
-          "VERSION=$version" >> $env:GITHUB_ENV
+          [ -f ".changes/v$version.md" ] || { echo "::error::missing .changes/v$version.md (run 'changie batch')"; exit 1; }
 
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
 
       - name: Download adb (Android SDK platform-tools)
-        shell: pwsh
         run: |
-          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile platform-tools.zip
-          Expand-Archive platform-tools.zip -DestinationPath .
-          Get-Content platform-tools/source.properties
-          New-Item -ItemType Directory adb | Out-Null
-          # adb.exe needs its two DLLs beside it; NOTICE.txt carries the licenses
-          Copy-Item platform-tools/adb.exe, platform-tools/AdbWinApi.dll, platform-tools/AdbWinUsbApi.dll, platform-tools/NOTICE.txt adb/
+          curl -fsSL -o platform-tools.zip \
+            "https://dl.google.com/android/repository/platform-tools-latest-${{ matrix.tools }}.zip"
+          python -c "import zipfile; zipfile.ZipFile('platform-tools.zip').extractall('.')"
+          cat platform-tools/source.properties
+          mkdir adb
+          # NOTICE.txt carries the licenses; on Windows adb.exe needs its two DLLs beside it
+          if [ "${{ matrix.platform }}" = windows ]; then
+            cp platform-tools/adb.exe platform-tools/AdbWinApi.dll platform-tools/AdbWinUsbApi.dll adb/
+          else
+            cp platform-tools/adb adb/
+          fi
+          cp platform-tools/NOTICE.txt adb/
 
-      - name: Draw the icon
-        # the logo is drawn by square_impact.py itself, so there's no image file to keep in sync
-        run: python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"
-
-      - name: Build exe
-        shell: pwsh
-        run: pyinstaller --onefile --console --name square_impact --icon square_impact.ico --add-data "adb;adb" square_impact.py
+      - name: Build
+        run: |
+          icon=()
+          if [ "${{ matrix.platform }}" = windows ]; then
+            # the logo is drawn by square_impact.py itself, so there's no image file to keep in sync
+            python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"
+            icon=(--icon square_impact.ico)
+          fi
+          pyinstaller --onefile --console --name square_impact "${icon[@]}" --add-data "adb:adb" square_impact.py
 
       - name: Smoke test (runs the bundled adb, no device needed)
-        shell: pwsh
         run: |
-          ./dist/square_impact.exe version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          exe=dist/square_impact; [ "${{ matrix.platform }}" = windows ] && exe=dist/square_impact.exe
+          "$exe" --help > /dev/null
+          "$exe" version
 
       - name: Package
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory release | Out-Null
-          Copy-Item dist/square_impact.exe, README.md, LICENSE, CHANGELOG.md release/
-          Copy-Item adb/NOTICE.txt release/adb-NOTICE.txt
-          Compress-Archive release/* square_impact-windows.zip
+          python - <<'EOF'
+          import os, zipfile
+          plat = "${{ matrix.platform }}"
+          exe = "square_impact.exe" if plat == "windows" else "square_impact"
+          files = [(f"dist/{exe}", exe), ("README.md", "README.md"), ("LICENSE", "LICENSE"),
+                   ("CHANGELOG.md", "CHANGELOG.md"), ("adb/NOTICE.txt", "adb-NOTICE.txt")]
+          with zipfile.ZipFile(f"square_impact-{plat}.zip", "w", zipfile.ZIP_DEFLATED) as z:
+              for src, name in files:
+                  info = zipfile.ZipInfo.from_file(src, name)
+                  if name == exe:
+                      info.external_attr = 0o100755 << 16   # executable once unzipped on macOS/Linux
+                  with open(src, "rb") as fh:
+                      z.writestr(info, fh.read(), zipfile.ZIP_DEFLATED)
+          print(f"square_impact-{plat}.zip")
+          EOF
 
       - uses: actions/upload-artifact@v7
         with:
-          name: square_impact-windows
-          path: square_impact-windows.zip
+          name: square_impact-${{ matrix.platform }}
+          path: square_impact-${{ matrix.platform }}.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version from the tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: square_impact-*
+          merge-multiple: true
+          path: release
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           body_path: .changes/v${{ env.VERSION }}.md
-          files: square_impact-windows.zip
+          files: release/square_impact-*.zip
+          fail_on_unmatched_files: true

@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.14.0 - 2026-10-26
+### Added
+* macOS (Apple Silicon and Intel) and Linux builds: every release now ships square_impact-macos-arm64.zip, square_impact-macos-x64.zip and square_impact-linux-x64.zip next to the Windows zip, each with adb built in, and square_impact update fetches the right one
+### Fixed
+* Two square_impacts could both listen on the overlay port on Windows, and OBS's requests landed on either; the port is now exclusive, and obs says clearly when it's taken
+
+## v0.13.0 - 2026-10-26
+### Added
+* Settings: every option can be set in square_impact.json next to the exe, and on a settings page (http://localhost:8765/settings, a Settings button in live, or square_impact settings) that saves to it. The page previews a saved shot with your changes as you make them, before saving. Most changes apply without a restart; command-line flags still win for that run
+
 ## v0.12.1 - 2026-10-19
 ### Fixed
 * The OBS replay no longer needs a cache refresh after square_impact restarts or updates: the page reconnects by itself (keep-alive pings every 5 s, reconnect after 15 s of silence). The README explains starting square_impact before OBS

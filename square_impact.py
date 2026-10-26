@@ -44,8 +44,9 @@ Usage:
     python square_impact.py grab [--shot]         # every buffer; with --shot, then finds impact
     python square_impact.py impact [DIR] [--pad N]  # find impact in a full-ring capture
     python square_impact.py view [DIR]            # view a capture (default: newest)
+    python square_impact.py settings              # settings page (saves square_impact.json)
     python square_impact.py version               # version and the adb in use
-    square_impact.exe update [--force]            # replace the exe with the latest GitHub release
+    square_impact update [--force]                # replace the executable with the latest GitHub release
 
 Only the newest KEEP_CAPTURES (5) capture folders in shots/ are kept.
 """
@@ -84,6 +85,20 @@ SESSIONS = 4        # parallel adb sessions per camera for shot captures
 # on exit, so user data lives next to the exe instead.
 FROZEN = getattr(sys, "frozen", False)
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+WINDOWS, MACOS = os.name == "nt", sys.platform == "darwin"
+EXE_NAME = "square_impact.exe" if WINDOWS else "square_impact"
+ADB_NAME = "adb.exe" if WINDOWS else "adb"
+
+
+def data_dir():
+    """Per-user folder for the bundled adb and the update-check cache."""
+    if WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or HERE
+    elif MACOS:
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "square_impact")
 SHOTS_DIR = os.path.join(HERE, "shots")
 KEEP_CAPTURES = 5   # older capture folders in shots/ are deleted after each save
 
@@ -96,20 +111,27 @@ def find_adb():
     adb = shutil.which("adb")
     if adb:
         return adb
-    pattern = os.path.expandvars(
-        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Google.PlatformTools*\platform-tools\adb.exe")
-    hits = glob.glob(pattern)
-    if hits:
-        return hits[0]
-    sys.exit("adb not found on PATH")
+    patterns = ([os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"
+                                    r"\Google.PlatformTools*\platform-tools\adb.exe")] if WINDOWS else
+                [os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"), "/opt/homebrew/bin/adb",
+                 "/usr/local/bin/adb"] if MACOS else
+                [os.path.expanduser("~/Android/Sdk/platform-tools/adb")])
+    for pattern in patterns:
+        hits = glob.glob(pattern)
+        if hits:
+            return hits[0]
+    sys.exit("adb not found: install Android platform-tools (" +
+             ("winget install Google.PlatformTools" if WINDOWS else
+              "brew install android-platform-tools" if MACOS else "e.g. apt install adb") + ")")
 
 
 def bundled_adb():
-    """The exe ships adb.exe + its DLLs. adb starts a server that keeps running
-    after we exit, so it must not run from PyInstaller's temp folder (deleted on
-    exit): copy it once to %LOCALAPPDATA%\\square_impact\\adb and run it there."""
+    """The exe ships adb (on Windows adb.exe + its DLLs). adb starts a server
+    that keeps running after we exit, so it must not run from PyInstaller's temp
+    folder (deleted on exit): copy it once to the per-user data folder
+    (data_dir()/adb) and run it there."""
     src = os.path.join(sys._MEIPASS, "adb")
-    dst = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "square_impact", "adb")
+    dst = os.path.join(data_dir(), "adb")
     os.makedirs(dst, exist_ok=True)
     for name in os.listdir(src):
         s, d = os.path.join(src, name), os.path.join(dst, name)
@@ -118,7 +140,10 @@ def bundled_adb():
                 shutil.copy2(s, d)
             except PermissionError:
                 pass  # in use by a running adb server; the existing copy works
-    return os.path.join(dst, "adb.exe")
+    adb = os.path.join(dst, ADB_NAME)
+    if not WINDOWS:
+        os.chmod(adb, 0o755)   # bundled data files lose the executable bit
+    return adb
 
 
 def version_info():
@@ -507,9 +532,11 @@ def snapshot_cmd(lay, cam, start, n):
     return f"stty -opost; echo {MARKER.decode()}; {body}"
 
 
-def fetch_window(lay, cams, start, n, parts=SESSIONS):
+def fetch_window(lay, cams, start, n, parts=None):
     """Read ring buffers start..start+n-1 (wrapping) of each camera with
-    parallel adb sessions. Returns ({cam: [frames in order]}, [buffers])."""
+    parallel adb sessions (SESSIONS per camera by default). Returns
+    ({cam: [frames in order]}, [buffers])."""
+    parts = parts or SESSIONS
     nb, st, fb = lay["nbuf"], lay["stride"], lay["w"] * lay["h"]
     bounds = [n * k // parts for k in range(parts + 1)]
     jobs = [(cam, o0, o1 - o0, Stream(snapshot_cmd(lay, cam, start + o0, o1 - o0),
@@ -695,9 +722,11 @@ def load_shot(shot_dir):
     return segs
 
 
-def prune_captures(keep=KEEP_CAPTURES):
-    """Delete all but the newest `keep` capture folders in shots/ (folder names
-    start with a YYYYMMDD_HHMMSS timestamp, so name order is time order)."""
+def prune_captures(keep=None):
+    """Delete all but the newest `keep` (default KEEP_CAPTURES) capture folders
+    in shots/ (folder names start with a YYYYMMDD_HHMMSS timestamp, so name
+    order is time order)."""
+    keep = keep or KEEP_CAPTURES
     dirs = sorted(d for d in glob.glob(os.path.join(SHOTS_DIR, "*")) if os.path.isdir(d))
     for d in dirs[:-keep]:
         shutil.rmtree(d, ignore_errors=True)
@@ -1277,7 +1306,7 @@ SHARPEN_AMOUNT = 1.2    # unsharp mask strength
 SHARPEN_THRESHOLD = 3   # grey levels: smaller differences are grain, left alone
 
 
-def tone_curve(frames, median=TONE_MEDIAN):
+def tone_curve(frames, median=None):
     """Lookup table that lifts a dark clip's shadows: from the black point (the
     1st percentile) a gamma curve that puts the clip's median at `median`. White
     stays white, so the ball keeps its shading rather than clipping. It never
@@ -1285,6 +1314,7 @@ def tone_curve(frames, median=TONE_MEDIAN):
     black point set."""
     sample = sorted(v for f in frames for v in f[::97])
     black, mid = sample[len(sample) // 100], sample[len(sample) // 2]
+    median = median or TONE_MEDIAN
     if black >= 250:
         return bytes(range(256))
     span = 255 - black
@@ -1314,6 +1344,7 @@ def enhance(frames, w, h, curves=None, background=None, parallel=True):
     grain threshold is in the sensor's grey levels.) `background` defaults to
     the clip's own; without one (fewer than 3 frames) everything counts as moving."""
     still, moving = curves or tone_curves(frames)
+    tune = (SHARPEN_AMOUNT, SHARPEN_THRESHOLD, MOTION_LO, MOTION_HI)
     n = len(frames)
     if background is None and n >= 3:
         background = still_background(frames)
@@ -1322,40 +1353,46 @@ def enhance(frames, w, h, curves=None, background=None, parallel=True):
             pool = process_pool()
             k = min(8, n)
             bounds = [n * i // k for i in range(k + 1)]
-            jobs = [pool.submit(_enhance_span, frames[lo:hi], w, h, background, still, moving)
+            jobs = [pool.submit(_enhance_span, frames[lo:hi], w, h, background, still, moving, tune)
                     for lo, hi in zip(bounds, bounds[1:])]
             return [f for j in jobs for f in j.result()]
         except (OSError, RuntimeError):   # no worker processes available: do it here
             pass
-    return _enhance_span(frames, w, h, background, still, moving)
+    return _enhance_span(frames, w, h, background, still, moving, tune)
 
 
-def _enhance_span(frames, w, h, background, still, moving):
+def _enhance_span(frames, w, h, background, still, moving, tune):
+    """Worker side of enhance(). `tune` carries the settings, since worker
+    processes don't see the main process's config: (sharpen amount, sharpen
+    threshold, MOTION_LO, MOTION_HI)."""
+    amount, thr, lo, hi = tune
     out = []
     for f in frames:
-        s = sharpen(f, w, h)
+        s = sharpen(f, w, h, amount, thr)
         if background is None:
             out.append(s.translate(moving))
             continue
         o = bytearray(len(s))
-        span = MOTION_HI - MOTION_LO
+        span = max(1, hi - lo)
         for i, (v, raw, b) in enumerate(zip(s, f, background)):
             d = raw - b if raw > b else b - raw   # motion judged on the unsharpened pixel
-            if d <= MOTION_LO:
+            if d <= lo:
                 o[i] = still[v]
-            elif d >= MOTION_HI:
+            elif d >= hi:
                 o[i] = moving[v]
             else:
-                o[i] = still[v] + (moving[v] - still[v]) * (d - MOTION_LO) // span
+                o[i] = still[v] + (moving[v] - still[v]) * (d - lo) // span
         out.append(bytes(o))
     return out
 
 
-def sharpen(f, w, h, amount=SHARPEN_AMOUNT, thr=SHARPEN_THRESHOLD):
+def sharpen(f, w, h, amount=None, thr=None):
     """Unsharp mask with a threshold: each pixel is pushed away from its 3x3
     neighbourhood mean, but only where it differs from it by more than `thr`,
     so the club's, shaft's and ball's edges get crisper while flat areas'
-    grain isn't amplified."""
+    grain isn't amplified. Defaults: SHARPEN_AMOUNT, SHARPEN_THRESHOLD."""
+    amount = SHARPEN_AMOUNT if amount is None else amount
+    thr = SHARPEN_THRESHOLD if thr is None else thr
     if w < 3 or h < 3:
         return f
     sums = []   # horizontal 3-pixel sums per row, edges repeated
@@ -1377,11 +1414,43 @@ def sharpen(f, w, h, amount=SHARPEN_AMOUNT, thr=SHARPEN_THRESHOLD):
     return bytes(out)
 
 
-def display_segments(shot_dir):
+# Display settings are module globals; a settings-page preview renders with
+# different values for a moment, so every render holds this lock.
+RENDER_LOCK = threading.RLock()
+# Denoising and ball tracking don't depend on the tunable settings, and are the
+# slow part of a render: kept for the last few (shot, camera, trim) combinations,
+# so previewing settings on a saved shot updates quickly.
+_RENDER_CACHE = collections.OrderedDict()
+RENDER_CACHE_SIZE = 8
+
+
+def _cached(key, make):
+    if key in _RENDER_CACHE:
+        _RENDER_CACHE.move_to_end(key)
+        return _RENDER_CACHE[key]
+    value = _RENDER_CACHE[key] = make()
+    while len(_RENDER_CACHE) > RENDER_CACHE_SIZE:
+        _RENDER_CACHE.popitem(last=False)
+    return value
+
+
+def display_segments(shot_dir, overrides=None):
     """A saved shot as shown in the overlay and viewers: per board segment, the
     frames trimmed (r1), denoised and enhanced (r1), cropped (--crop; by default
     a still window centred on the ball's starting position) and with cameras
-    stacked. Saved files are never changed."""
+    stacked. Saved files are never changed. `overrides`: {setting key: value}
+    to render with instead of the current settings (the settings page's preview)."""
+    with RENDER_LOCK:
+        saved = {s["attr"]: globals()[s["attr"]] for s in SETTINGS if s["key"] in (overrides or {})}
+        try:
+            for k, v in (overrides or {}).items():
+                globals()[SETTING[k]["attr"]] = v
+            return _display_segments(shot_dir)
+        finally:
+            globals().update(saved)
+
+
+def _display_segments(shot_dir):
     out = []
     for s in load_shot(shot_dir):
         idxs = s["idxs"]
@@ -1396,15 +1465,17 @@ def display_segments(shot_dir):
         raws = [s["frames"][cam][lo:hi] for cam in s["cams"]]
         # before cropping: denoise needs aligned frames, and sharpening the crop's
         # black padding would draw a line along its edge
-        shown = [denoise(raw) if r1 and DISPLAY_DENOISE else raw for raw in raws]
+        shown = [_cached(("denoise", shot_dir, cam, lo, hi), lambda raw=raw: denoise(raw))
+                 if r1 and DISPLAY_DENOISE else raw for cam, raw in zip(s["cams"], raws)]
         if r1 and DISPLAY_ENHANCE:
             curves = tone_curves([f for frames in shown for f in frames])   # one pair: cameras match
             shown = [enhance(frames, w, h, curves) for frames in shown]
         per_cam = []
-        for raw, frames in zip(raws, shown):
+        for cam, raw, frames in zip(s["cams"], raws, shown):
             if on_ball:
                 cw, ch = BALL_CROP
-                path = ball_path(raw, w, h, s["board"])
+                path = _cached(("ball", shot_dir, cam, lo, hi),
+                               lambda raw=raw, w=w, h=h, b=s["board"]: ball_path(raw, w, h, b))
                 if DISPLAY_CROP == "ball":
                     path = [path[0]] * len(path)   # where the clip starts, then hold still
                 frames = [crop_window(f, w, h, x, y, cw, ch) for f, (x, y) in zip(frames, path)]
@@ -1537,7 +1608,7 @@ class Viewer:
                               showvalue=False, command=lambda v: self.show(int(v)), bg="#111",
                               fg="#ddd", highlightthickness=0)
         self.scale.grid(row=2, column=0, padx=6, sticky="we")
-        bar = tk.Frame(self.root, bg="#111")
+        bar = self.bar = tk.Frame(self.root, bg="#111")
         bar.grid(row=3, column=0, pady=4)
         for text, fn in [("<<", lambda: self.step(-10)), ("<", lambda: self.step(-1)),
                          ("Play/Pause", self.toggle), (">", lambda: self.step(1)),
@@ -1554,6 +1625,18 @@ class Viewer:
         self.root.bind("<Left>", lambda e: self.step(-1))
         self.root.bind("<Right>", lambda e: self.step(1))
         self.root.bind("<space>", lambda e: self.toggle())
+        import webbrowser
+        tk.Button(bar, text="Settings", width=10,
+                  command=lambda: webbrowser.open(settings_url())).pack(side="left", padx=2)
+        self.root.after(300, self.watch_settings)
+
+    def watch_settings(self):
+        """Saved on the settings page: show the shot on screen with the new settings."""
+        if CONFIG_EVENT.is_set():
+            CONFIG_EVENT.clear()
+            if self.dir:
+                self.load(self.dir)
+        self.root.after(300, self.watch_settings)
 
     def set_status(self, text):
         self.status.configure(text=text)
@@ -1644,7 +1727,8 @@ def board_loop(lay, cams, pad, out_q, stop):
     """Capture loop for one board (r1 launch or r2 spin), driven by a LogWatcher.
     Reports to out_q: ("armed"|"fetching", board),
     ("segment", board, seg, summary, notes, t_shot), ("ignored"|"error", board, text),
-    ("gone", board).
+    ("gone", board). cams/pad None: use the current settings at each shot, so
+    changes made on the settings page apply from the next shot.
 
     Self-healing: the watcher is restarted if its adb session ends or goes
     silent for LOG_STALL seconds (sqocam logs every 15 s, so silence = stalled),
@@ -1673,13 +1757,15 @@ def board_loop(lay, cams, pad, out_q, stop):
             except queue.Empty:
                 continue
             out_q.put(("fetching", board))
+            shot_cams = cams or CAM_LISTS[CAPTURE_CAM]   # None: the current settings, per shot
+            shot_pad = CAPTURE_PAD if pad is None else pad
             try:
                 if board == "r2":
-                    seg, summary = r2_segment(lay, capture_r2(lay, cams, event, watcher.history()))
+                    seg, summary = r2_segment(lay, capture_r2(lay, shot_cams, event, watcher.history()))
                     notes = []
                 else:
-                    cap = capture_r1(lay, cams, event)
-                    seg, summary, notes = r1_segment(lay, cap, pad)
+                    cap = capture_r1(lay, shot_cams, event)
+                    seg, summary, notes = r1_segment(lay, cap, shot_pad)
                     end = time.time() + SQOCAM_RESULT_WAIT
                     while not sqocam_text(watcher.history(), event["t"]) and time.time() < end:
                         time.sleep(0.1)
@@ -1858,14 +1944,16 @@ OVERLAY_PAGE = r"""<!doctype html>
 </style></head>
 <body><div id="wrap"><canvas id="c"></canvas><div id="info"></div></div>
 <script>
-// URL options: fps (launch-camera playback speed, default 30), fps2 (spin-camera
-// close-up, default 10), hold (ms to freeze on the impact frame, 700; 0 = no
-// freeze), loops (2), gap (ms between loops, 250), fade (ms, 300),
-// gain (brightness multiplier, 1), info=1 (show sqocam's numbers)
+// Options (defaults from the settings page / square_impact.json; a URL parameter
+// overrides): fps (launch-camera playback speed), fps2 (spin-camera close-up),
+// hold (ms to freeze on the impact frame; 0 = no freeze), loops, gap (ms between
+// loops), fade (ms), gain (brightness multiplier), info=1 (show sqocam's numbers)
 const P = new URLSearchParams(location.search);
-const FPS = +P.get('fps') || 30, FPS2 = +P.get('fps2') || 10, LOOPS = +P.get('loops') || 2,
-      GAP = +(P.get('gap') ?? 250), FADE = +P.get('fade') || 300, GAIN = +P.get('gain') || 1,
-      INFO = P.get('info') === '1', HOLD = +(P.get('hold') ?? 700);
+const CFG = __CONFIG__;
+const opt = k => P.has(k) ? P.get(k) : String(CFG[k]);
+const FPS = +opt('fps') || 30, FPS2 = +opt('fps2') || 10, LOOPS = +opt('loops') || 2,
+      GAP = +opt('gap') || 0, FADE = +opt('fade') || 0, GAIN = +opt('gain') || 1,
+      INFO = ['1', 'true'].includes(opt('info')), HOLD = +opt('hold') || 0;
 const QUIET_MS = 15000;   // no event or ping for this long (pings come every 5 s): reconnect
 document.documentElement.style.setProperty('--fade', FADE + 'ms');
 const wrap = document.getElementById('wrap'), cv = document.getElementById('c'),
@@ -1936,6 +2024,7 @@ function connect() {
   es = new EventSource('/events');
   es.onopen = () => { heard = performance.now(); };
   es.addEventListener('ping', () => { heard = performance.now(); });
+  es.addEventListener('config', () => location.reload());   // settings saved: pick them up
   es.onmessage = e => { heard = performance.now(); show(JSON.parse(e.data)); };
 }
 connect();
@@ -1948,6 +2037,360 @@ setInterval(() => {
 
 OVERLAY_PING = 5   # seconds between keep-alive pings on /events (the page reconnects after 15 s without)
 
+SETTINGS_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>square_impact settings</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  :root { --bg: #0b1522; --card: #13233a; --line: #22385a; --text: #e8eef6; --dim: #93a4ba;
+          --accent: #ff8a1f; --accent-ink: #1b0e02; --ok: #4cc38a; --bad: #ff6b6b; --field: #0e1a2c; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f3f5f8; --card: #ffffff; --line: #d9e0ea; --text: #142033; --dim: #5b6b80;
+            --field: #f7f9fc; --accent-ink: #1b0e02; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 22px 16px 8px;
+           max-width: 1440px; margin: 0 auto; }
+  .layout { max-width: 1440px; margin: 0 auto; padding: 8px 16px 110px; display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(380px, 560px); gap: 0 24px; align-items: start; }
+  .layout > main { padding: 0; max-width: none; margin: 0; min-width: 0; }
+  aside { position: sticky; top: 12px; }
+  @media (max-width: 1100px) { .layout { grid-template-columns: minmax(0, 1fr); }
+                               aside { position: static; order: -1; } }
+  .pv { padding-bottom: 14px; }
+  .pvhead { display: flex; gap: 8px; padding: 6px 18px 10px; }
+  .pvhead select { flex: 1; min-width: 0; }
+  .pvhead button { padding: 7px 12px; }
+  .screen { position: relative; background: #000; margin: 0 18px; border-radius: 8px; overflow: hidden;
+            min-height: 60px; }
+  .screen canvas { display: block; width: 100%; height: auto; }
+  #pvBusy { position: absolute; top: 8px; right: 8px; font-size: 12px; padding: 2px 9px;
+            border-radius: 999px; background: var(--accent); color: var(--accent-ink); font-weight: 600;
+            visibility: hidden; }
+  #pvBusy.on { visibility: visible; }
+  .pvinfo { display: flex; justify-content: space-between; gap: 10px; padding: 8px 18px 0;
+            font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #pvFrame.impact { color: var(--accent); font-weight: 600; }
+  .pv .help { padding: 6px 18px 0; margin: 0; }
+  header img { width: 48px; height: 48px; }
+  h1 { font-size: 20px; margin: 0; }
+  header p { margin: 2px 0 0; color: var(--dim); font-size: 13px; word-break: break-all; }
+  main { max-width: 860px; margin: 0 auto; padding: 8px 16px 110px; }
+  .warn { border: 1px solid var(--bad); border-radius: 10px; padding: 10px 14px; margin: 10px 0;
+          color: var(--bad); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+            margin: 16px 0; overflow: hidden; }
+  section h2 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
+               margin: 0; padding: 14px 18px 6px; }
+  .row { display: grid; grid-template-columns: 1fr 220px; gap: 6px 18px; padding: 12px 18px;
+         border-top: 1px solid var(--line); }
+  section h2 + .row { border-top: 0; }
+  .row label { font-weight: 600; }
+  .help { color: var(--dim); font-size: 13px; margin-top: 2px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 12px; }
+  .tag { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--dim); }
+  .tag.file { border-color: var(--accent); color: var(--accent); }
+  .tag.cli { border-color: var(--bad); color: var(--bad); }
+  .reset { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0 2px;
+           font: inherit; font-size: 12px; text-decoration: underline; }
+  .ctl { align-self: center; justify-self: end; width: 100%; }
+  input[type=number], select { width: 100%; padding: 8px 10px; border-radius: 9px; font: inherit;
+         border: 1px solid var(--line); background: var(--field); color: var(--text); }
+  input[type=number]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .switch { justify-self: end; }
+  .switch input { width: 46px; height: 26px; appearance: none; border-radius: 999px; cursor: pointer;
+                  background: var(--line); position: relative; transition: background .15s; margin: 0; }
+  .switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+                         border-radius: 50%; background: #fff; transition: left .15s; }
+  .switch input:checked { background: var(--accent); }
+  .switch input:checked::after { left: 23px; }
+  .row.changed { box-shadow: inset 3px 0 0 var(--accent); }
+  .err { grid-column: 1 / -1; color: var(--bad); font-size: 13px; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card);
+         border-top: 1px solid var(--line); padding: 12px 16px; }
+  .bar div { max-width: 1440px; margin: 0 auto; display: flex; gap: 10px; align-items: center; }
+  .bar span { flex: 1; color: var(--dim); font-size: 14px; }
+  .bar span.ok { color: var(--ok); } .bar span.bad { color: var(--bad); }
+  button.primary, button.secondary { font: inherit; font-weight: 600; border-radius: 9px;
+         padding: 9px 18px; cursor: pointer; border: 1px solid var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--line); }
+  button:disabled { opacity: .45; cursor: default; }
+  @media (max-width: 600px) { .row { grid-template-columns: 1fr; } .ctl { justify-self: stretch; }
+                              .switch { justify-self: start; } }
+</style></head>
+<body>
+<header><img src="/logo.png" alt=""><div><h1>square_impact settings</h1><p id="path"></p></div></header>
+<div class="layout">
+<main><div id="warnings"></div><div id="groups">Loading…</div></main>
+<aside><section class="pv">
+  <h2>Preview</h2>
+  <div class="pvhead">
+    <select id="pvShot" aria-label="Saved shot"></select>
+    <button class="secondary" id="pvPrev" title="Previous frame" aria-label="Previous frame">◀</button>
+    <button class="secondary" id="pvPlay">Pause</button>
+    <button class="secondary" id="pvNext" title="Next frame" aria-label="Next frame">▶</button>
+  </div>
+  <div class="screen"><canvas id="pv"></canvas><div id="pvBusy">Rendering…</div></div>
+  <div class="pvinfo"><span id="pvFrame"></span><span id="pvStatus"></span></div>
+  <p class="help">A shot saved on this computer, shown with your changes before you save them:
+    Display and Image tuning settings are rendered by square_impact, playback settings
+    (speed, freeze, pause, brightness) apply instantly.</p>
+</section></aside>
+</div>
+<div class="bar"><div><span id="status">No changes</span>
+  <button class="secondary" id="discard" disabled>Discard</button>
+  <button class="primary" id="save" disabled>Save</button></div></div>
+<script>
+const APPLIES = { 'live': 'applies right away', 'next shot': 'applies from the next shot',
+                  'restart': 'applies after a restart' };
+let state = null;           // last state from the server
+const edits = {};           // key -> new value, or null = back to the default
+
+const el = (tag, props = {}, ...kids) => {
+  const e = Object.assign(document.createElement(tag), props);
+  for (const k of kids) if (k != null) e.append(k);
+  return e;
+};
+const shown = s => s.key in edits ? (edits[s.key] === null ? s.default : edits[s.key])
+                                  : (s.saved ?? s.default);
+
+function control(s) {
+  const v = shown(s);
+  if (s.kind === 'bool') {
+    const i = el('input', { type: 'checkbox', checked: !!v, id: 'f_' + s.key });
+    i.onchange = () => edit(s, i.checked);
+    return el('span', { className: 'ctl switch' }, i);
+  }
+  if (s.kind === 'choice') {
+    const sel = el('select', { id: 'f_' + s.key });
+    for (const c of s.choices) sel.append(el('option', { value: c, textContent: c, selected: c === v }));
+    sel.onchange = () => edit(s, sel.value);
+    return el('span', { className: 'ctl' }, sel);
+  }
+  const i = el('input', { type: 'number', id: 'f_' + s.key, value: v,
+                          step: s.step ?? (s.kind === 'int' ? 1 : 'any') });
+  if (s.min != null) i.min = s.min;
+  if (s.max != null) i.max = s.max;
+  i.oninput = () => { if (i.value !== '') edit(s, Number(i.value)); };
+  return el('span', { className: 'ctl' }, i);
+}
+
+// edits[key]: a value to save, or null to take the setting out of the file (its default)
+function edit(s, v) {
+  if (v === (s.saved ?? s.default)) delete edits[s.key];   // back to what's saved: no change
+  else edits[s.key] = v === s.default ? null : v;
+  refreshBar();
+  document.getElementById('row_' + s.key).classList.toggle('changed', s.key in edits);
+  schedulePreview(s.key);
+}
+
+// ---- preview: a saved shot rendered with the unsaved changes
+const PLAYBACK = ['fps', 'fps2', 'hold', 'gap', 'gain'];   // applied here, no re-render
+let previewKeys = new Set();       // rendered by square_impact (Display, Image tuning)
+let pv = null, pvReq = 0, pvTimer = null, pvAbort = null;
+const player = { tl: [], loopMs: 1, t0: 0, paused: false, idx: 0, lut: new Uint32Array(256), last: -1 };
+const $ = id => document.getElementById(id);
+const valueOf = k => shown(state.settings.find(s => s.key === k));
+
+function schedulePreview(key) {
+  if (key && PLAYBACK.includes(key)) return buildTimeline(false);
+  if (key && !previewKeys.has(key)) return;
+  clearTimeout(pvTimer);
+  pvTimer = setTimeout(renderPreview, 300);   // wait for typing / slider moves to settle
+}
+
+async function renderPreview() {
+  const shot = $('pvShot').value;
+  if (!shot) return;
+  const my = ++pvReq;
+  if (pvAbort) pvAbort.abort();               // a newer change replaces a render in flight
+  pvAbort = new AbortController();
+  $('pvBusy').classList.add('on');
+  const t = performance.now();
+  try {
+    const r = await fetch('/api/preview', { method: 'POST', signal: pvAbort.signal,
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ shot, settings: edits }) });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    const ab = await r.arrayBuffer();
+    if (my !== pvReq) return;
+    const n = new DataView(ab).getUint32(0);
+    pv = { header: JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 4, n))),
+           buf: new Uint8Array(ab, 4 + n) };
+    buildTimeline(false);
+    $('pvStatus').textContent = 'rendered in ' + ((performance.now() - t) / 1000).toFixed(1) + ' s';
+  } catch (e) {
+    if (e.name !== 'AbortError' && my === pvReq) $('pvStatus').textContent = 'Preview failed: ' + e.message;
+  } finally {
+    if (my === pvReq) $('pvBusy').classList.remove('on');
+  }
+}
+
+function buildTimeline(restart) {
+  if (!pv) return;
+  const fps = +valueOf('fps') || 30, fps2 = +valueOf('fps2') || 10, hold = +valueOf('hold') || 0;
+  const gain = +valueOf('gain') || 1;
+  for (let i = 0; i < 256; i++) { const v = Math.min(255, Math.round(i * gain));
+    player.lut[i] = 0xff000000 | (v << 16) | (v << 8) | v; }
+  const tl = []; let off = 0, t = 0;
+  for (const g of pv.header.segments) {
+    const ms = 1000 / (g.board === 'r2' ? fps2 : fps);
+    for (let f = 0; f < g.n; f++) {
+      tl.push({ g, f, o: off + f * g.w * g.h, start: t });
+      t += ms + (f === g.impact ? hold : 0);
+    }
+    off += g.n * g.w * g.h;
+  }
+  const pos = player.tl.length ? (performance.now() - player.t0) % player.loopMs : 0;
+  player.tl = tl;
+  player.loopMs = Math.max(1, t + (+valueOf('gap') || 0));
+  player.t0 = performance.now() - (restart ? 0 : Math.min(pos, player.loopMs - 1));
+  player.idx = Math.min(player.idx, tl.length - 1);
+  player.last = -1;                           // redraw: frames, size or brightness changed
+}
+
+const cv = $('pv'), ctx = cv.getContext('2d');
+let img = null, px = null;
+function draw(i) {
+  const e = player.tl[i];
+  if (!e) return;
+  if (cv.width !== e.g.w || cv.height !== e.g.h || !img) {
+    cv.width = e.g.w; cv.height = e.g.h;
+    img = ctx.createImageData(e.g.w, e.g.h); px = new Uint32Array(img.data.buffer);
+  }
+  for (let k = 0, n = e.g.w * e.g.h; k < n; k++) px[k] = player.lut[pv.buf[e.o + k]];
+  ctx.putImageData(img, 0, 0);
+  const cam = e.g.board === 'r2' ? 'spin camera' : 'launch camera';
+  $('pvFrame').textContent = cam + ' · frame ' + (e.f + 1) + '/' + e.g.n +
+                             (e.f === e.g.impact ? ' · impact' : '');
+  $('pvFrame').classList.toggle('impact', e.f === e.g.impact);
+}
+
+function tick() {
+  if (player.tl.length) {
+    if (!player.paused) {
+      const lt = (performance.now() - player.t0) % player.loopMs;
+      let i = 0;
+      while (i + 1 < player.tl.length && player.tl[i + 1].start <= lt) i++;
+      player.idx = i;
+    }
+    if (player.idx !== player.last) { draw(player.idx); player.last = player.idx; }
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+function setPaused(p) {
+  if (!p) player.t0 = performance.now() - (player.tl[player.idx]?.start || 0);   // resume from here
+  player.paused = p;
+  $('pvPlay').textContent = p ? 'Play' : 'Pause';
+}
+$('pvPlay').onclick = () => setPaused(!player.paused);
+cv.onclick = () => setPaused(!player.paused);
+const step = d => { setPaused(true); const n = player.tl.length;
+                    if (n) player.idx = (player.idx + d + n) % n; };
+$('pvPrev').onclick = () => step(-1);
+$('pvNext').onclick = () => step(1);
+$('pvShot').onchange = () => { pv = null; renderPreview(); };
+
+async function initPreview() {
+  const r = await fetch('/api/shots', { cache: 'no-store' });
+  const { shots, preview_groups } = await r.json();
+  previewKeys = new Set(state.settings.filter(s => preview_groups.includes(s.group)).map(s => s.key));
+  const sel = $('pvShot');
+  for (const name of shots) {
+    const m = name.match(/^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)_shot_(.+)$/);
+    sel.append(el('option', { value: name,
+      textContent: m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]} (${m[7]})` : name }));
+  }
+  if (shots.length) renderPreview();
+  else { sel.append(el('option', { textContent: 'No saved shots yet' })); sel.disabled = true;
+         $('pvStatus').textContent = 'Hit a shot and it will appear here'; }
+}
+
+function render(errors = {}) {
+  document.getElementById('path').textContent = 'v' + state.version + ' · saved to ' + state.path;
+  const w = document.getElementById('warnings');
+  w.replaceChildren(...state.warnings.map(t => el('div', { className: 'warn', textContent: t })));
+  const groups = new Map();
+  for (const s of state.settings) {
+    if (!groups.has(s.group)) groups.set(s.group, el('section', {}, el('h2', { textContent: s.group })));
+    const meta = el('div', { className: 'meta' },
+      el('span', { className: 'tag', textContent: APPLIES[s.applies] }),
+      el('span', { className: 'tag', textContent: 'default ' + s.default }));
+    if (s.saved != null)
+      meta.append(el('span', { className: 'tag file', textContent: 'set in config file' }));
+    if (s.source === 'command line')
+      meta.append(el('span', { className: 'tag cli',
+        textContent: 'overridden on the command line (now ' + s.value + ')' }));
+    if (shown(s) !== s.default) {
+      const r = el('button', { className: 'reset', textContent: 'reset to default', type: 'button' });
+      r.onclick = () => { edit(s, s.default); render(); };
+      meta.append(r);
+    }
+    const row = el('div', { className: 'row' + (s.key in edits ? ' changed' : ''), id: 'row_' + s.key },
+      el('div', {}, el('label', { htmlFor: 'f_' + s.key, textContent: s.label }),
+         s.help ? el('div', { className: 'help', textContent: s.help }) : null, meta),
+      control(s),
+      errors[s.key] ? el('div', { className: 'err', textContent: s.label + ' ' + errors[s.key] }) : null);
+    groups.get(s.group).append(row);
+  }
+  document.getElementById('groups').replaceChildren(...groups.values());
+}
+
+function refreshBar(msg, cls = '') {
+  const n = Object.keys(edits).length;
+  const st = document.getElementById('status');
+  st.textContent = msg || (n ? n + ' unsaved change' + (n > 1 ? 's' : '') : 'No changes');
+  st.className = cls;
+  document.getElementById('save').disabled = !n;
+  document.getElementById('discard').disabled = !n;
+}
+
+async function load() {
+  const r = await fetch('/api/settings', { cache: 'no-store' });
+  state = await r.json();
+  render();
+  refreshBar();
+  initPreview();
+}
+
+document.getElementById('discard').onclick = () => {
+  const rerender = Object.keys(edits).some(k => previewKeys.has(k));
+  for (const k of Object.keys(edits)) delete edits[k];
+  render(); refreshBar();
+  buildTimeline(false);
+  if (rerender) schedulePreview();
+};
+document.getElementById('save').onclick = async () => {
+  const btn = document.getElementById('save');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify(edits) });
+    const body = await r.json();
+    if (!r.ok) {
+      render(body.errors || {});
+      return refreshBar(body.error || 'Not saved: fix the highlighted settings', 'bad');
+    }
+    const restart = state.settings.some(s => s.key in edits && s.applies === 'restart');
+    for (const k of Object.keys(edits)) delete edits[k];
+    state = body;
+    render();
+    refreshBar(restart ? 'Saved. Restart square_impact for the port or update setting to take effect.'
+                       : 'Saved', 'ok');
+  } catch (e) {
+    refreshBar('Not saved: square_impact isn\'t reachable', 'bad');
+    btn.disabled = false;
+  }
+};
+window.addEventListener('beforeunload', e => { if (Object.keys(edits).length) e.preventDefault(); });
+load();
+</script></body></html>
+"""
+
 
 class Overlay:
     """Latest shot, served to the OBS browser source: frames as raw 8-bit gray,
@@ -1958,6 +2401,12 @@ class Overlay:
         self.seq = 0          # bumps on every publish; clients play when it changes
         self.shots = {}       # seq -> (header dict, frame bytes); last few kept
         self.current = None
+        self.config_seq = 0   # bumps when settings are saved; open pages reload
+
+    def config_changed(self):
+        with self.cond:
+            self.config_seq += 1
+            self.cond.notify_all()
 
     shot_dir = None   # folder of the latest shot, for /impact.png
 
@@ -2009,12 +2458,70 @@ def serve_overlay(ov, port):
             self.end_headers()
             self.wfile.write(body)
 
+        def local_host(self):
+            """Only requests addressed to this machine by name: a web page can't
+            reach the settings through a DNS name it points at 127.0.0.1."""
+            port = self.server.server_address[1]
+            return self.headers.get("Host", "") in (f"localhost:{port}", f"127.0.0.1:{port}")
+
+        def send_json(self, code, obj):
+            return self.send(code, "application/json", json.dumps(obj).encode())
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if path not in ("/api/settings", "/api/preview"):
+                return self.send(404, "text/plain", b"not found\n")
+            port = self.server.server_address[1]
+            origin = self.headers.get("Origin")
+            # JSON only (a cross-site form can't send it without the browser asking
+            # first, which we never answer), from our own page if an origin is given
+            is_json = self.headers.get("Content-Type", "").startswith("application/json")
+            if (not self.local_host() or not is_json
+                    or origin not in (None, f"http://localhost:{port}", f"http://127.0.0.1:{port}")):
+                return self.send_json(403, {"error": "forbidden"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                changes = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+                if not isinstance(changes, dict):
+                    raise ValueError
+            except ValueError:
+                return self.send_json(400, {"error": "expected a JSON object of settings"})
+            if path == "/api/preview":   # {"shot": name, "settings": {unsaved edits}}: render, don't save
+                try:
+                    header, data = preview_payload(str(changes.get("shot")),
+                                                   dict(changes.get("settings") or {}))
+                except (ValueError, TypeError, OSError, KeyError) as e:
+                    return self.send_json(400, {"error": str(e)})
+                head = json.dumps(header).encode()   # 4-byte length, header JSON, then the frames
+                return self.send(200, "application/octet-stream", struct.pack(">I", len(head)) + head + data)
+            try:
+                errors = save_settings(changes)
+            except OSError as e:
+                return self.send_json(500, {"error": f"couldn't write {CONFIG_PATH}: {e}"})
+            if errors:
+                return self.send_json(400, {"errors": errors})
+            ov.config_changed()
+            return self.send_json(200, settings_state())
+
         def do_GET(self):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
-                return self.send(200, "text/html; charset=utf-8", OVERLAY_PAGE.encode())
+                page = OVERLAY_PAGE.replace("__CONFIG__", json.dumps(page_config()))
+                return self.send(200, "text/html; charset=utf-8", page.encode())
+            if path in ("/settings", "/api/settings"):
+                if not self.local_host():
+                    return self.send(403, "text/plain", b"open this page as http://localhost:PORT/settings\n")
+                if path == "/settings":
+                    return self.send(200, "text/html; charset=utf-8", SETTINGS_PAGE.encode())
+                return self.send_json(200, settings_state())
+            if path == "/api/shots":
+                if not self.local_host():
+                    return self.send(403, "text/plain", b"forbidden\n")
+                return self.send_json(200, {"shots": saved_shots(), "preview_groups": PREVIEW_GROUPS})
             if path in ("/favicon.png", "/favicon.ico"):
                 return self.send(200, "image/png", logo_png(32))
+            if path == "/logo.png":
+                return self.send(200, "image/png", logo_png(96))
             if path == "/impact.png":   # still of the latest shot's moment of impact
                 snap = ov.shot_dir and os.path.join(ov.shot_dir, "impact.png")
                 if not snap or not os.path.exists(snap):
@@ -2039,24 +2546,39 @@ def serve_overlay(ov, port):
                 self.end_headers()
                 with ov.cond:
                     seen = ov.seq  # don't replay the last shot when OBS (re)loads the page
+                    cseen = ov.config_seq
                 try:
                     self.wfile.write(b"retry: 2000\n\n")   # browser's reconnect delay after a drop
                     self.wfile.flush()
                     while True:
                         with ov.cond:
-                            ov.cond.wait_for(lambda s=seen: ov.seq != s, timeout=OVERLAY_PING)
-                            fresh = ov.seq != seen
-                            seen = ov.seq
+                            ov.cond.wait_for(lambda s=seen, c=cseen: ov.seq != s or ov.config_seq != c,
+                                             timeout=OVERLAY_PING)
+                            fresh, reconfigured = ov.seq != seen, ov.config_seq != cseen
+                            seen, cseen = ov.seq, ov.config_seq
                             header = ov.shots[seen][0] if fresh else None
-                        # a named event, not an SSE comment: the page's watchdog has to see it
-                        msg = f"data: {json.dumps(header)}\n\n" if fresh else "event: ping\ndata: \n\n"
+                        # named events, not SSE comments: the page's watchdog has to see them
+                        msg = (f"data: {json.dumps(header)}\n\n" if fresh else
+                               "event: config\ndata: \n\n" if reconfigured else "event: ping\ndata: \n\n")
                         self.wfile.write(msg.encode())
                         self.wfile.flush()
                 except OSError:
                     return  # client went away
             return self.send(404, "text/plain", b"not found\n")
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    class Server(http.server.ThreadingHTTPServer):
+        # http.server allows address reuse, which on Windows lets a second
+        # square_impact bind the same port as a running one, and requests then
+        # land on either. Exclusive there; elsewhere reuse only skips TIME_WAIT.
+        allow_reuse_address = os.name != "nt"
+
+        def server_bind(self):
+            if os.name == "nt":
+                import socket
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+    srv = Server(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -2065,7 +2587,11 @@ def serve_overlay(ov, port):
 def obs(cams, pad, port):
     """Headless capture from the connected boards, feeding an OBS browser-source overlay."""
     ov = Overlay()
-    serve_overlay(ov, port)
+    try:
+        serve_overlay(ov, port)
+    except OSError:
+        sys.exit(f"port {port} is in use: is square_impact already running (obs, live or settings)? "
+                 f"Stop it, or pick another port with --port or the settings page.")
     if DISPLAY_DENOISE or DISPLAY_ENHANCE:
         warm_up_pool()
     try:  # last saved shot, so /replay works for positioning before any new shot
@@ -2079,6 +2605,7 @@ def obs(cams, pad, port):
           f"  options: {url}?fps=30&fps2=10&loops=2&gain=1.5&info=1\n"
           f"  re-show the last shot (for positioning): {url}replay\n"
           f"  still of the latest impact: {url}impact.png\n"
+          f"Settings: {url}settings (saved to {CONFIG_PATH})\n"
           f"Ctrl+C to stop.", flush=True)
     stop = threading.Event()
 
@@ -2102,12 +2629,319 @@ def obs(cams, pad, port):
         stop.set()
 
 
+# ---------------------------------------------------------------- settings
+
+# Every setting can be overridden from square_impact.json next to the exe (or
+# the script), and edited on the settings page (http://localhost:8765/settings).
+# Precedence: built-in default < the file < a command-line flag.
+CONFIG_PATH = os.path.join(HERE, "square_impact.json")
+CAPTURE_CAM = "top"     # set from settings: cam
+CAPTURE_PAD = 30        # set from settings: pad
+OVERLAY_PORT = 8765     # set from settings: port
+UPDATE_CHECK = True     # set from settings: update_check
+CAM_LISTS = {"0": [0], "top": [0], "1": [1], "bottom": [1], "both": [0, 1]}
+
+
+def _setting(key, group, kind, default, label, help, attr=None, applies="live", **limits):
+    return {"key": key, "group": group, "kind": kind, "default": default, "label": label,
+            "help": help, "attr": attr, "applies": applies, **limits}
+
+
+SETTINGS = [
+    _setting("cam", "Capture", "choice", "top", "Launch camera",
+             "Which of the launch board's two cameras to capture and show: top (higher up, "
+             "looking down at the ball), bottom (low and level), or both stacked.",
+             "CAPTURE_CAM", "next shot", choices=["top", "bottom", "both"]),
+    _setting("pad", "Capture", "int", 30, "Frames kept around contact",
+             "Frames saved before and after contact in each clip (500 fps: 30 frames = 60 ms).",
+             "CAPTURE_PAD", "next shot", min=5, max=34),
+    _setting("keep_captures", "Capture", "int", 5, "Shots kept on disk",
+             "Newest shot folders kept in shots/. Older ones are deleted after each new shot.",
+             "KEEP_CAPTURES", "next shot", min=1, max=1000),
+    _setting("min_ball_contrast", "Capture", "int", 40, "Ball detection threshold",
+             "How much brighter than the floor a resting ball must be for a launch-camera event to "
+             "count as a shot (a ball scores 70-92, an empty floor ~16). Lower it if real shots are "
+             "ignored in a bright room; raise it if events with no ball get through.",
+             "MIN_BALL_CONTRAST", "next shot", min=5, max=150),
+    _setting("pair_window", "Capture", "float", 8.0, "Two-board pairing window (s)",
+             "With both cameras' USB cables connected: how long to wait for the other board's "
+             "capture of the same shot before showing what's there.",
+             "PAIR_WINDOW", "next shot", min=1, max=30, step=0.5),
+    _setting("adb_sessions", "Capture", "int", 4, "Parallel transfers per camera",
+             "adb sessions used to read a shot off the Omni. 4 is about the fastest; fewer puts "
+             "less load on the Omni.", "SESSIONS", "next shot", min=1, max=8),
+
+    _setting("crop", "Display", "choice", "ball", "Crop",
+             "ball: a 640x192 window centred on the ball where it starts, then held still. follow: "
+             "the same window panning with the ball. left / right / full: fixed parts of the launch "
+             "camera's frame. Saved clips always keep the full frame.",
+             "DISPLAY_CROP", choices=list(CROPS)),
+    _setting("trim_front", "Display", "float", 0.2, "Trim start",
+             "Fraction of each clip dropped from the start, where the club is still on its way in. "
+             "0 shows everything.", "DISPLAY_TRIM_FRONT", min=0, max=0.45, step=0.05),
+    _setting("trim_back", "Display", "float", 0.2, "Trim end",
+             "Fraction of each clip dropped from the end, where the ball is flying away.",
+             "DISPLAY_TRIM_BACK", min=0, max=0.45, step=0.05),
+    _setting("denoise", "Display", "bool", True, "Denoise",
+             "Average the launch camera's sensor grain out of the still parts of each frame.",
+             "DISPLAY_DENOISE"),
+    _setting("enhance", "Display", "bool", True, "Enhance",
+             "Lift the launch camera's dark scene and sharpen edges (see Image tuning).",
+             "DISPLAY_ENHANCE"),
+
+    _setting("tone_median", "Image tuning", "int", 50, "Brightness of moving things",
+             "Where the shadow lift puts a clip's median brightness, for whatever moves (the "
+             "club, the struck ball). 0-255.", "TONE_MEDIAN", min=10, max=200),
+    _setting("tone_median_still", "Image tuning", "int", 28, "Brightness of the still scene",
+             "The same for the still turf and room. Keep it well below the moving value so the "
+             "club stands out.", "TONE_MEDIAN_STILL", min=5, max=200),
+    _setting("tone_gamma_min", "Image tuning", "float", 0.4, "Strongest lift",
+             "Smallest gamma the lift may use: lower lifts dark clips harder (and shows more grain).",
+             "TONE_GAMMA_MIN", min=0.2, max=1.0, step=0.05),
+    _setting("motion_lo", "Image tuning", "int", 4, "Motion: still below",
+             "Grey levels a pixel may differ from the clip's still background and still count as "
+             "still scene.", "MOTION_LO", min=0, max=60),
+    _setting("motion_hi", "Image tuning", "int", 14, "Motion: moving above",
+             "Grey levels of difference from which a pixel gets the full moving lift (in between, "
+             "it's blended).", "MOTION_HI", min=1, max=100),
+    _setting("sharpen_amount", "Image tuning", "float", 1.2, "Sharpening strength",
+             "How hard edges are sharpened. 0 turns sharpening off.", "SHARPEN_AMOUNT",
+             min=0, max=4, step=0.1),
+    _setting("sharpen_threshold", "Image tuning", "int", 3, "Sharpening grain threshold",
+             "Grey levels: smaller differences are treated as grain and left alone.",
+             "SHARPEN_THRESHOLD", min=0, max=40),
+
+    _setting("port", "OBS overlay", "int", 8765, "Web server port",
+             "Port of the overlay (http://localhost:PORT/) and this settings page.",
+             "OVERLAY_PORT", "restart", min=1024, max=65535),
+    _setting("fps", "OBS overlay", "float", 30, "Launch camera playback (fps)",
+             "Playback speed of the launch camera's swing.", min=1, max=120),
+    _setting("fps2", "OBS overlay", "float", 10, "Spin camera playback (fps)",
+             "Playback speed of the spin camera's close-up.", min=1, max=120),
+    _setting("hold", "OBS overlay", "int", 700, "Freeze on impact (ms)",
+             "How long playback pauses on the impact frame. 0 for no pause.", min=0, max=5000),
+    _setting("loops", "OBS overlay", "int", 2, "Plays per shot",
+             "How many times each shot plays before the overlay hides.", min=1, max=10),
+    _setting("gap", "OBS overlay", "int", 250, "Pause between plays (ms)", "", min=0, max=5000),
+    _setting("fade", "OBS overlay", "int", 300, "Fade in/out (ms)", "", min=0, max=3000),
+    _setting("gain", "OBS overlay", "float", 1.0, "Brightness multiplier",
+             "Multiplies every pixel's brightness in the overlay.", min=0.2, max=4, step=0.1),
+    _setting("info", "OBS overlay", "bool", False, "Show the Omni's numbers",
+             "Overlay ball speed, launch, direction and spin from the Omni's own log."),
+
+    _setting("update_check", "Updates", "bool", True, "Check for updates",
+             "The exe checks GitHub for a newer release when it starts (once a day at most).",
+             "UPDATE_CHECK", "restart"),
+]
+SETTING = {s["key"]: s for s in SETTINGS}
+PAGE_SETTINGS = [s["key"] for s in SETTINGS if s["group"] == "OBS overlay" and s["key"] != "port"]
+CONFIG = {"file": {}, "cli": {}, "warnings": []}   # what the file and the command line set
+CONFIG_EVENT = threading.Event()   # set when settings are saved, for viewers to re-render
+
+
+def coerce_setting(key, value):
+    """A valid value for setting `key`, or ValueError saying what's wrong."""
+    s = SETTING[key]
+    kind = s["kind"]
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        raise ValueError("must be true or false")
+    if kind == "choice":
+        if value in s["choices"]:
+            return value
+        raise ValueError("must be one of " + ", ".join(s["choices"]))
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("must be a number")
+    try:
+        v = float(value)
+    except ValueError:
+        raise ValueError("must be a number") from None
+    if kind == "int":
+        if v != int(v):
+            raise ValueError("must be a whole number")
+        v = int(v)
+    if not s.get("min", -math.inf) <= v <= s.get("max", math.inf):
+        raise ValueError(f"must be between {s['min']} and {s['max']}")
+    return int(v) if v == int(v) else v   # 12, not 12.0, in the file
+
+
+def setting(key):
+    """Effective value: command line, else the config file, else the default."""
+    for src in (CONFIG["cli"], CONFIG["file"]):
+        if key in src:
+            return src[key]
+    return SETTING[key]["default"]
+
+
+def apply_settings():
+    for s in SETTINGS:
+        if s["attr"]:
+            globals()[s["attr"]] = setting(s["key"])
+
+
+def read_config_file(path=None):
+    """(valid settings, everything in the file, warnings). A missing file is
+    fine; a broken one is reported and ignored rather than stopping capture."""
+    path = path or CONFIG_PATH
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}, {}, []
+    except (OSError, ValueError) as e:
+        return {}, {}, [f"{os.path.basename(path)}: couldn't read it ({e}); using defaults"]
+    if not isinstance(raw, dict):
+        return {}, {}, [f"{os.path.basename(path)}: expected a JSON object; using defaults"]
+    valid, warnings = {}, []
+    for k, v in raw.items():
+        if k not in SETTING:
+            warnings.append(f"{os.path.basename(path)}: unknown setting {k!r} ignored")
+            continue
+        try:
+            valid[k] = coerce_setting(k, v)
+        except ValueError as e:
+            warnings.append(f"{os.path.basename(path)}: {k} {e}; using {setting(k)!r}")
+    return valid, raw, warnings
+
+
+def load_settings(cli=None):
+    """Read the config file, take the command line's overrides, apply both."""
+    valid, _, warnings = read_config_file()
+    CONFIG.update(file=valid, cli=dict(cli or {}), warnings=warnings)
+    apply_settings()
+    return warnings
+
+
+def save_settings(changes):
+    """Validate and save {key: value} to the config file (None removes a key,
+    i.e. back to the default), keeping anything else in it, then apply.
+    Returns {key: error} (nothing saved) or {} on success."""
+    errors, clean = {}, {}
+    for k, v in changes.items():
+        if k not in SETTING:
+            errors[k] = "unknown setting"
+            continue
+        if v is None:
+            clean[k] = None
+            continue
+        try:
+            clean[k] = coerce_setting(k, v)
+        except ValueError as e:
+            errors[k] = str(e)
+    if errors:
+        return errors
+    _, raw, _ = read_config_file()
+    for k, v in clean.items():
+        if v is None:
+            raw.pop(k, None)
+        else:
+            raw[k] = v
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:   # write then swap: never a half-written file
+        json.dump(raw, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+    CONFIG["file"] = read_config_file()[0]
+    apply_settings()
+    CONFIG_EVENT.set()
+    return {}
+
+
+def settings_state():
+    """Everything the settings page shows."""
+    out = []
+    for s in SETTINGS:
+        src = "command line" if s["key"] in CONFIG["cli"] else \
+              "config file" if s["key"] in CONFIG["file"] else "default"
+        out.append({k: v for k, v in s.items() if k != "attr"} |
+                   {"value": setting(s["key"]), "source": src, "saved": CONFIG["file"].get(s["key"])})
+    return {"settings": out, "path": CONFIG_PATH, "warnings": CONFIG["warnings"], "version": VERSION}
+
+
+def settings_url():
+    return f"http://localhost:{OVERLAY_PORT}/settings"
+
+
+def start_settings_server():
+    """Serve the settings page for as long as this command runs (every mode has
+    it; obs's overlay server serves it itself). If the port is taken, by
+    another square_impact, that one's page edits the same file."""
+    try:
+        serve_overlay(Overlay(), OVERLAY_PORT)
+        print(paint("2", f"  settings: {settings_url()}"), flush=True)
+    except OSError:
+        print(paint("2", f"  settings: {settings_url()} (served by the square_impact already running)"),
+              flush=True)
+
+
+def settings_command():
+    """Open the settings page. If square_impact obs is running, its server
+    already serves it (and applies changes live); otherwise serve it here."""
+    import socket
+    import webbrowser
+    url = settings_url()
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        running = sock.connect_ex(("127.0.0.1", OVERLAY_PORT)) == 0
+    if running:
+        print(f"square_impact is already running: opening its settings page, {url}", flush=True)
+        webbrowser.open(url)
+        return
+    srv = serve_overlay(Overlay(), OVERLAY_PORT)
+    print(f"Settings page: {url}\nSaved to: {CONFIG_PATH}\nCtrl+C to stop.", flush=True)
+    webbrowser.open(url)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.shutdown()
+
+
+PREVIEW_GROUPS = ("Display", "Image tuning")   # rendered by square_impact; the rest play in the page
+
+
+def saved_shots():
+    """Shot folders in shots/ that the preview can play, newest first."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(SHOTS_DIR, "*")), reverse=True):
+        meta = os.path.join(d, "meta.json")
+        if os.path.isdir(d) and os.path.exists(meta) and "_shot_" in os.path.basename(d):
+            out.append(os.path.basename(d))
+    return out
+
+
+def preview_payload(name, edits):
+    """(header, frames) for saved shot `name` rendered with the settings page's
+    unsaved values (`edits`: {key: value, or None = default}) for the display
+    settings, like overlay_payload. ValueError for a bad shot or value."""
+    if name not in saved_shots():
+        raise ValueError(f"no saved shot {name!r}")
+    overrides = {}
+    for k, v in edits.items():
+        if k in SETTING and SETTING[k]["group"] in PREVIEW_GROUPS:
+            overrides[k] = SETTING[k]["default"] if v is None else coerce_setting(k, v)
+    segs = display_segments(os.path.join(SHOTS_DIR, name), overrides)
+    header = {"name": name,
+              "segments": [{"board": s["board"], "w": s["w"], "h": s["h"], "n": len(s["frames"]),
+                            "impact": s["impact"]} for s in segs]}
+    return header, b"".join(b"".join(s["frames"]) for s in segs)
+
+
+def page_config():
+    """The overlay page's options, as defaults its URL parameters can still override."""
+    return {k: setting(k) for k in PAGE_SETTINGS}
+
+
 # ---------------------------------------------------------------- main
 
-VERSION = "0.12.1"
+VERSION ="0.12.1"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
+    "settings": "settings",
 }
 
 
@@ -2203,7 +3037,7 @@ REPO = "moexx399/square_impact"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 UPDATE_CHECK_EVERY = 24 * 3600  # seconds between checks (GitHub allows 60 requests/hour)
-UPDATE_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "square_impact",
+UPDATE_CACHE = os.path.join(data_dir(),
                             "update_check.json")
 
 
@@ -2254,13 +3088,14 @@ def update_notice(release):
     new, ours = parse_version(release["tag"]), parse_version(VERSION)
     if new and ours and new > ours:
         return (f"Update available: {VERSION} -> {release['tag'].lstrip('v')}   "
-                f"run 'square_impact.exe update' or see {release['url']}")
+                f"run '{EXE_NAME} update' or see {release['url']}")
     return None
 
 
 def update_check_enabled(opt_out):
     """On for the packaged exe (source users update with git), unless opted out."""
-    return FROZEN and not opt_out and not os.environ.get("SQUARE_IMPACT_NO_UPDATE_CHECK")
+    return (FROZEN and UPDATE_CHECK and not opt_out
+            and not os.environ.get("SQUARE_IMPACT_NO_UPDATE_CHECK"))
 
 
 def start_update_check():
@@ -2276,8 +3111,17 @@ def start_update_check():
 
 # ---------------------------------------------------------------- self-update
 
-RELEASE_ASSET = "square_impact-windows.zip"
-EXE_NAME = "square_impact.exe"
+def release_platform():
+    """This build's name in release asset names: windows, macos-arm64, macos-x64, linux-x64."""
+    import platform
+    if WINDOWS:
+        return "windows"
+    arch = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "amd64": "x64"}.get(
+        platform.machine().lower(), platform.machine().lower())
+    return f"{'macos' if MACOS else 'linux'}-{arch}"
+
+
+RELEASE_ASSET = f"square_impact-{release_platform()}.zip"
 
 
 def cleanup_old_exe():
@@ -2290,19 +3134,21 @@ def cleanup_old_exe():
 
 
 def self_update(force=False):
-    """Replace this exe with the latest GitHub release's.
+    """Replace this executable with the latest GitHub release's (the asset for
+    this platform: RELEASE_ASSET).
 
-    Windows can't overwrite a running exe but can rename it, so: download and
-    verify the new one, test-run it, rename the running exe to .old, put the new
-    one in its place (rolling back on any failure). The .old file is removed the
-    next time the program starts."""
+    Download and verify the new one, test-run it, then swap it in. Windows can't
+    overwrite a running exe but can rename it: the running exe is renamed to
+    .old, the new one put in its place (rolling back on any failure), and .old
+    is removed the next time the program starts. macOS and Linux let a running
+    program's file be replaced outright."""
     import hashlib
     import tempfile
     import urllib.request
     import zipfile
 
     if not FROZEN:
-        sys.exit("running from source: update with `git pull` (self-update is for square_impact.exe)")
+        sys.exit(f"running from source: update with `git pull` (self-update is for {EXE_NAME})")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": f"square_impact/{VERSION}"}
     try:
         with urllib.request.urlopen(urllib.request.Request(LATEST_RELEASE_API, headers=headers),
@@ -2352,22 +3198,29 @@ def self_update(force=False):
             new_exe = os.path.join(work, EXE_NAME)
             with z.open(name) as src, open(new_exe, "wb") as dst:
                 shutil.copyfileobj(src, dst)
+        if not WINDOWS:
+            os.chmod(new_exe, 0o755)   # zip extraction doesn't keep the executable bit
         check = subprocess.run([new_exe, "--help"], capture_output=True, timeout=60)
         if check.returncode != 0:
             sys.exit("the downloaded exe failed to start; not updating")
 
         current = sys.executable
-        old = current + ".old"
-        try:
-            os.remove(old)
-        except OSError:
-            pass
-        os.replace(current, old)          # allowed for a running exe
-        try:
-            shutil.copy2(new_exe, current)
-        except OSError:
-            os.replace(old, current)      # roll back
-            raise
+        if WINDOWS:
+            old = current + ".old"
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+            os.replace(current, old)          # allowed for a running exe
+            try:
+                shutil.copy2(new_exe, current)
+            except OSError:
+                os.replace(old, current)      # roll back
+                raise
+        else:   # copy beside it, then swap in one step; the running program keeps its old file
+            staged = current + ".new"
+            shutil.copy2(new_exe, staged)
+            os.replace(staged, current)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(f"updated to {tag.lstrip('v')}: {current}\n"
@@ -2379,23 +3232,23 @@ def main():
     multiprocessing.freeze_support()   # denoise worker processes inside the packaged exe
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
-                                    "impact", "version", "update"])
+                                    "impact", "settings", "version", "update"])
     ap.add_argument("arg", nargs="?", help="sample: step N; view/impact: capture dir")
     ap.add_argument("--shot", action="store_true", help="sample/grab: wait for the next shot")
     ap.add_argument("--range", metavar="A:B", help="sample: only buffers A..B-1 (e.g. 120:150)")
     ap.add_argument("--cam", choices=["0", "1", "top", "bottom", "both"], default=None,
                     help="0/top (upper, tilted down) or 1/bottom (lower, level); "
                          "default top for live/shot, both otherwise")
-    ap.add_argument("--pad", type=int, default=30, help="frames kept before/after impact (30)")
-    ap.add_argument("--port", type=int, default=8765, help="obs: overlay web server port (8765)")
-    ap.add_argument("--trim-front", type=float, default=0.2, metavar="FRACTION",
+    ap.add_argument("--pad", type=int, help="frames kept before/after impact (30)")
+    ap.add_argument("--port", type=int, help="obs/settings: web server port (8765)")
+    ap.add_argument("--trim-front", type=float, metavar="FRACTION",
                     help="drop this fraction of each clip's start in the overlay and viewers, "
                          "where the club is still on its way in (default 0.2; 0 shows all; "
                          "saved clips keep every frame)")
-    ap.add_argument("--trim-back", type=float, default=0.2, metavar="FRACTION",
+    ap.add_argument("--trim-back", type=float, metavar="FRACTION",
                     help="drop this fraction of each clip's end in the overlay and viewers, "
                          "where the ball is rolling away (default 0.2; 0 shows all)")
-    ap.add_argument("--crop", choices=list(CROPS), default="ball",
+    ap.add_argument("--crop", choices=list(CROPS),
                     help="what the OBS overlay and viewers show: ball = a 640x192 window centred "
                          "on the ball at the start of the clip, then held still (default); follow = "
                          "the same window panning with the ball; left/right/full = fixed parts "
@@ -2420,7 +3273,10 @@ def main():
         return version_info()
     if a.cmd == "update":
         return self_update(a.force)
+    warnings = load_settings(cli_overrides(a))
     banner(a.cmd)
+    for w in warnings:
+        print(paint("1;93", f"  ! {w}"), flush=True)
     upd = start_update_check() if update_check_enabled(a.no_update_check) else None
     try:
         return run(a)
@@ -2429,27 +3285,40 @@ def main():
             upd.join(timeout=2)  # let a short command (status, view) still show the notice
 
 
+def cli_overrides(a):
+    """The settings given on the command line (they win over the config file)."""
+    cli = {"pad": a.pad, "port": a.port, "trim_front": a.trim_front, "trim_back": a.trim_back,
+           "crop": a.crop}
+    if a.cam and a.cmd in ("obs", "live", "shot"):   # grab/sample take --cam for themselves
+        cli["cam"] = {"0": "top", "1": "bottom"}.get(a.cam, a.cam)
+    if a.no_denoise:
+        cli["denoise"] = False
+    if a.no_enhance:
+        cli["enhance"] = False
+    if a.no_update_check:
+        cli["update_check"] = False
+    return {k: v for k, v in cli.items() if v is not None}
+
+
 def run(a):
-    global ADB, SERIAL, DISPLAY_CROP, DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK, DISPLAY_DENOISE, DISPLAY_ENHANCE
-    DISPLAY_CROP = a.crop
-    DISPLAY_TRIM_FRONT, DISPLAY_TRIM_BACK = a.trim_front, a.trim_back
-    DISPLAY_DENOISE = not a.no_denoise
-    DISPLAY_ENHANCE = not a.no_enhance
+    global ADB, SERIAL
+    if a.cmd == "settings":
+        return settings_command()
+    if a.cmd != "obs":   # obs's overlay server serves the settings page too
+        start_settings_server()
     if a.cmd == "view":
         return view(a.arg)
     if a.cmd == "impact":
-        d = impact(a.arg, a.pad)
+        d = impact(a.arg, CAPTURE_PAD)
         return None if a.no_view else view(d)
     ADB = find_adb()
     stop_children_at_exit()
-    cam_map = {"0": [0], "top": [0], "1": [1], "bottom": [1], "both": [0, 1]}
-    if a.cmd in ("obs", "live", "shot"):
-        cams = cam_map[a.cam or "top"]
+    if a.cmd in ("obs", "live", "shot"):   # camera and padding come from the settings, per shot
         if a.cmd == "obs":
-            return obs(cams, a.pad, a.port)
+            return obs(None, None, OVERLAY_PORT)
         if a.cmd == "live":
-            return live(cams, a.pad)
-        d = shot_once(cams, a.pad)
+            return live(None, None)
+        d = shot_once(None, None)
         return None if a.no_view else view(d)
     if a.cmd == "status":
         return status()
@@ -2457,7 +3326,7 @@ def run(a):
     if a.board and a.board not in boards:
         sys.exit(f"{a.board} isn't connected (connected: {', '.join(boards) or 'none'})")
     SERIAL = boards.get(a.board) or boards.get("r1") or next(iter(boards.values()), None)
-    cams = cam_map[a.cam or "both"]
+    cams = CAM_LISTS[a.cam or "both"]
     nbuf = device_layout()["nbuf"]
     lo, hi = (int(x) for x in a.range.split(":")) if a.range else (0, nbuf)
     cam_tag = "" if len(cams) == 2 else f"_cam{cams[0]}"
@@ -2468,7 +3337,7 @@ def run(a):
     else:
         d = capture(list(range(nbuf)), cams, a.shot, "all" + cam_tag)
     if a.shot and not a.range and (a.cmd == "grab" or step == 1):
-        d = impact(d, a.pad)  # full ring of a shot: cut out the frames around impact
+        d = impact(d, CAPTURE_PAD)  # full ring of a shot: cut out the frames around impact
     if not a.no_view:
         view(d)
 

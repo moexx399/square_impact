@@ -7,7 +7,7 @@
 [![release](https://img.shields.io/github/v/release/moexx399/square_impact?include_prereleases)](https://github.com/moexx399/square_impact/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![platform: windows](https://img.shields.io/badge/platform-windows-lightgrey)
+![platforms: windows | macos | linux](https://img.shields.io/badge/platforms-windows%20%7C%20macos%20%7C%20linux-lightgrey)
 
 **Instant high-speed replays from the Square Omni launch monitor's own cameras.**
 
@@ -27,23 +27,47 @@ viewer or as a pop-up overlay in OBS.
 
 **Contents:** [Quick start](#quick-start) · [OBS overlay](#obs-overlay-options) ·
 [Commands](#commands) · [Output](#output) · [How it works](#how-it-works) ·
-[Building the exe](#building-the-exe) · [Known limits](#known-limits) ·
+[Building](#building-the-executables) · [Known limits](#known-limits) ·
 [Contributing](#contributing) · [Changelog](CHANGELOG.md)
 
 ---
 
 ## Quick start
 
-**Easiest:** download `square_impact-windows.zip` from the GitHub Releases page
-(or from the latest `build-exe` workflow run). It contains a single
-`square_impact.exe` with `adb` built in, so no Python or Android tools are
-needed. Use it exactly like the commands below, replacing
-`python square_impact.py` with `square_impact.exe`. Shots are saved in a `shots`
-folder next to the exe. The bundled adb is unpacked once to
-`%LOCALAPPDATA%\square_impact\adb\`.
+**Easiest:** download the zip for your computer from the GitHub Releases page
+(or from the latest `build-exe` workflow run). Each contains a single executable
+with `adb` built in, so no Python or Android tools are needed:
 
-**From source:** Windows, Python 3 (standard library only, nothing to `pip install`),
-and `adb` (`winget install Google.PlatformTools`).
+| Computer | Download | Run it as |
+|---|---|---|
+| Windows | `square_impact-windows.zip` | `square_impact.exe` |
+| Mac with Apple Silicon (M1 and later) | `square_impact-macos-arm64.zip` | `./square_impact` |
+| Mac with an Intel processor | `square_impact-macos-x64.zip` | `./square_impact` |
+| Linux (x86-64) | `square_impact-linux-x64.zip` | `./square_impact` |
+
+Use it exactly like the commands below, replacing `python square_impact.py` with
+the executable. Shots are saved in a `shots` folder next to it. The bundled adb
+is unpacked once to a per-user folder: `%LOCALAPPDATA%\square_impact\adb` on
+Windows, `~/Library/Application Support/square_impact/adb` on macOS,
+`~/.local/share/square_impact/adb` on Linux.
+
+- **macOS, first run:** the executable isn't signed by Apple, so macOS blocks it
+  ("cannot be opened because the developer cannot be verified"). Allow it once
+  in **System Settings → Privacy & Security → Open Anyway**, or clear the
+  download flag in Terminal: `xattr -d com.apple.quarantine square_impact`.
+- **Linux, first run:** adb needs permission to open the Omni's USB device
+  without root. Add a udev rule for the camera boards (USB ID `18d1:d002`),
+  then unplug and replug the Omni:
+  ```bash
+  echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="d002", MODE="0660", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/51-square-omni.rules
+  sudo udevadm control --reload-rules
+  ```
+
+**From source:** Python 3.10+ (standard library only, nothing to `pip install`;
+on Linux the viewers need Tk, e.g. `apt install python3-tk`) and `adb`:
+`winget install Google.PlatformTools` on Windows, `brew install
+android-platform-tools` on macOS, `apt install adb` (or your distribution's
+package) on Linux.
 
 1. Connect one or both of the Omni's camera USB ports to the PC. Each shows up
    as `Tina ADB` in Device Manager:
@@ -89,7 +113,7 @@ once it's back.
 
 ## OBS overlay options
 
-Add these to the Browser Source URL, e.g. `http://localhost:8765/?gain=1.5&info=1`:
+Set these on the [settings page](#settings), or per Browser Source in its URL, e.g. `http://localhost:8765/?gain=1.5&info=1`:
 
 | Option  | Default | Meaning |
 |---------|---------|---------|
@@ -117,6 +141,82 @@ within a few seconds and the next shot plays.
 the latest shot's moment of impact (see [Output](#output)). Use it in a second
 Browser Source if you want the still on screen next to the replay.
 
+## Settings
+
+Every setting can be changed in **`square_impact.json` next to the exe** (or
+next to `square_impact.py` when running from source), and on a **settings page**
+that saves to that file:
+
+- in **every mode** while square_impact is running: <http://localhost:8765/settings>
+  (printed at startup; the `live`, `view` and `shot` viewer windows also have a
+  **Settings** button, and re-render the shot on screen when you save);
+- when nothing is running, `square_impact settings` serves the page and opens it.
+
+Only one square_impact can serve the port at a time. A second one started
+alongside (say `view` while `obs` runs) uses the first one's page, which edits
+the same file.
+
+The page has a **preview** that plays a shot saved on the computer (pick any
+from `shots/`) with your changes applied as you make them, before you save:
+crop, trims, denoise, enhance and the image tuning are rendered by square_impact
+(about 0.5–1.5 s; the slow steps are cached), playback speed, freeze, pause and
+brightness apply instantly. ◀ ▶ step through it frame by frame; the impact
+frame is marked.
+
+Once saved, most changes apply straight away, without a restart: display and overlay
+settings from the next replay (open OBS overlay pages reload themselves), and
+capture settings from the next shot. The port and the update check apply after
+a restart.
+
+Where a value comes from, highest first: a **command-line flag** (e.g.
+`--crop full`, for that run only), then **the file**, then the **built-in
+default**. The page shows which one is in effect for each setting. The file only
+holds what you've changed, for example:
+
+```json
+{
+  "crop": "follow",
+  "fps": 24,
+  "info": true
+}
+```
+
+A setting with a bad value, or an unknown one, is reported at startup and
+ignored (the rest of the file still applies), so a typo never stops capture.
+Overlay URL options (`?fps=…`) still override the file for that one Browser
+Source.
+
+| Setting | Group | Default | Allowed | Takes effect | Meaning |
+|---|---|---|---|---|---|
+| `cam` | Capture | top | top / bottom / both | next shot | Which of the launch board's two cameras to capture and show: top (higher up, looking down at the ball), bottom (low and level), or both stacked. |
+| `pad` | Capture | 30 | 5–34 | next shot | Frames saved before and after contact in each clip (500 fps: 30 frames = 60 ms). |
+| `keep_captures` | Capture | 5 | 1–1000 | next shot | Newest shot folders kept in shots/. Older ones are deleted after each new shot. |
+| `min_ball_contrast` | Capture | 40 | 5–150 | next shot | How much brighter than the floor a resting ball must be for a launch-camera event to count as a shot (a ball scores 70-92, an empty floor ~16). Lower it if real shots are ignored in a bright room; raise it if events with no ball get through. |
+| `pair_window` | Capture | 8.0 | 1–30 | next shot | With both cameras' USB cables connected: how long to wait for the other board's capture of the same shot before showing what's there. |
+| `adb_sessions` | Capture | 4 | 1–8 | next shot | adb sessions used to read a shot off the Omni. 4 is about the fastest; fewer puts less load on the Omni. |
+| `crop` | Display | ball | ball / follow / full / left / right | right away | ball: a 640x192 window centred on the ball where it starts, then held still. follow: the same window panning with the ball. left / right / full: fixed parts of the launch camera's frame. Saved clips always keep the full frame. |
+| `trim_front` | Display | 0.2 | 0–0.45 | right away | Fraction of each clip dropped from the start, where the club is still on its way in. 0 shows everything. |
+| `trim_back` | Display | 0.2 | 0–0.45 | right away | Fraction of each clip dropped from the end, where the ball is flying away. |
+| `denoise` | Display | on | true / false | right away | Average the launch camera's sensor grain out of the still parts of each frame. |
+| `enhance` | Display | on | true / false | right away | Lift the launch camera's dark scene and sharpen edges (see Image tuning). |
+| `tone_median` | Image tuning | 50 | 10–200 | right away | Where the shadow lift puts a clip's median brightness, for whatever moves (the club, the struck ball). 0-255. |
+| `tone_median_still` | Image tuning | 28 | 5–200 | right away | The same for the still turf and room. Keep it well below the moving value so the club stands out. |
+| `tone_gamma_min` | Image tuning | 0.4 | 0.2–1.0 | right away | Smallest gamma the lift may use: lower lifts dark clips harder (and shows more grain). |
+| `motion_lo` | Image tuning | 4 | 0–60 | right away | Grey levels a pixel may differ from the clip's still background and still count as still scene. |
+| `motion_hi` | Image tuning | 14 | 1–100 | right away | Grey levels of difference from which a pixel gets the full moving lift (in between, it's blended). |
+| `sharpen_amount` | Image tuning | 1.2 | 0–4 | right away | How hard edges are sharpened. 0 turns sharpening off. |
+| `sharpen_threshold` | Image tuning | 3 | 0–40 | right away | Grey levels: smaller differences are treated as grain and left alone. |
+| `port` | OBS overlay | 8765 | 1024–65535 | restart | Port of the overlay (http://localhost:PORT/) and this settings page. |
+| `fps` | OBS overlay | 30 | 1–120 | right away | Playback speed of the launch camera's swing. |
+| `fps2` | OBS overlay | 10 | 1–120 | right away | Playback speed of the spin camera's close-up. |
+| `hold` | OBS overlay | 700 | 0–5000 | right away | How long playback pauses on the impact frame. 0 for no pause. |
+| `loops` | OBS overlay | 2 | 1–10 | right away | How many times each shot plays before the overlay hides. |
+| `gap` | OBS overlay | 250 | 0–5000 | right away | Pause between plays (ms) |
+| `fade` | OBS overlay | 300 | 0–3000 | right away | Fade in/out (ms) |
+| `gain` | OBS overlay | 1.0 | 0.2–4 | right away | Multiplies every pixel's brightness in the overlay. |
+| `info` | OBS overlay | off | true / false | right away | Overlay ball speed, launch, direction and spin from the Omni's own log. |
+| `update_check` | Updates | on | true / false | restart | The exe checks GitHub for a newer release when it starts (once a day at most). |
+
 ## Commands
 
 ```text
@@ -129,8 +229,9 @@ python square_impact.py status                     board, frame layout, recent d
 python square_impact.py grab  [--shot]             every buffer in the ring (slow; for digging)
 python square_impact.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
 python square_impact.py impact [DIR]               find impact in a full-ring capture
+python square_impact.py settings                   open the settings page (saves square_impact.json)
 python square_impact.py version                    version, update check, and the adb in use
-square_impact.exe update [--force]                 replace the exe with the latest release
+square_impact update [--force]                     replace the executable with the latest release
 
 common options:
   --cam top|bottom|both   which camera (default: top for obs/live/shot)
@@ -210,14 +311,16 @@ version. To turn it off, use `--no-update-check` or set
 To install an update, close square_impact and run:
 
 ```bash
-square_impact.exe update
+square_impact update
 ```
 
-It downloads `square_impact-windows.zip` from the latest GitHub release,
-verifies its SHA-256 against the digest GitHub publishes, test-runs the new exe,
-then swaps it in. The old exe is kept as `square_impact.exe.old` until the next
-start, and the swap rolls back if anything fails. `--force` reinstalls the
-latest release even if you already have it.
+(`square_impact.exe update` on Windows.) It downloads the zip for your platform
+(`square_impact-windows.zip`, `-macos-arm64`, `-macos-x64` or `-linux-x64`) from
+the latest GitHub release, verifies its SHA-256 against the digest GitHub
+publishes, test-runs the new executable, then swaps it in. On Windows the old exe
+is kept as `square_impact.exe.old` until the next start, and the swap rolls back
+if anything fails; macOS and Linux replace the file in one step. `--force`
+reinstalls the latest release even if you already have it.
 
 ## Output
 
@@ -325,34 +428,54 @@ reading it.
 | Transfer rate | ~2.3 MB/s | ~10 MB/s |
 | Finding contact | 0.3–0.9 s | 0.07 s |
 
-## Building the exe
+## Building the executables
 
-`.github/workflows/build-exe.yml` runs on every push and pull request
-(`windows-latest`, Python 3.13). It:
+`.github/workflows/build-exe.yml` runs on every push and pull request, building
+on four GitHub runners with Python 3.13:
 
-1. downloads Google's latest Android SDK platform-tools and takes `adb.exe`,
-   `AdbWinApi.dll`, `AdbWinUsbApi.dll` and `NOTICE.txt`;
-2. draws the icon (`square_impact.ico`, from `logo_ico()` in the script) and
-   builds a one-file `square_impact.exe` with PyInstaller, bundling those files;
-3. smoke-tests it with `square_impact.exe version`, which runs the bundled adb
-   and needs no device;
-4. uploads `square_impact-windows.zip` (exe, README, LICENSE, adb license notice) as a
-   workflow artifact, and attaches it to a GitHub Release when the push is a
-   `v*` tag (`git tag v0.1.0 && git push --tags`).
+| Runner | Builds |
+|---|---|
+| `windows-latest` | `square_impact-windows.zip` |
+| `macos-latest` (Apple Silicon) | `square_impact-macos-arm64.zip` |
+| `macos-15-intel` | `square_impact-macos-x64.zip` |
+| `ubuntu-22.04` | `square_impact-linux-x64.zip` (the oldest supported Ubuntu, so it runs on newer distributions too) |
+
+Each one:
+
+1. downloads Google's latest Android SDK platform-tools for its platform and
+   takes `adb` (on Windows `adb.exe` with `AdbWinApi.dll` and `AdbWinUsbApi.dll`)
+   and `NOTICE.txt`;
+2. builds a one-file executable with PyInstaller, bundling those files (on
+   Windows with the icon, drawn by `logo_ico()` in the script);
+3. smoke-tests it with `square_impact version`, which runs the bundled adb and
+   needs no device;
+4. uploads its zip (executable, README, LICENSE, CHANGELOG, adb license notice)
+   as a workflow artifact.
+
+On a version tag (`git tag v0.1.0 && git push --tags`), a final job checks the
+tag matches `VERSION` and publishes all four zips as one GitHub Release. The zip
+names are what `square_impact update` looks for (`release_platform()`).
 
 To build locally, do the same by hand:
 
 ```bash
 pip install pyinstaller
-mkdir adb   # then copy adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll, NOTICE.txt from platform-tools into it
-python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"
-pyinstaller --onefile --console --name square_impact --icon square_impact.ico --add-data "adb;adb" square_impact.py
+mkdir adb   # copy adb (Windows: adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll) and NOTICE.txt from platform-tools into it
+python -c "import square_impact as s; open('square_impact.ico', 'wb').write(s.logo_ico())"   # Windows only
+pyinstaller --onefile --console --name square_impact --icon square_impact.ico --add-data "adb:adb" square_impact.py
 ```
+
+(Leave out `--icon square_impact.ico` on macOS and Linux.)
 
 adb is part of the Android SDK platform-tools (Apache 2.0). Its license notice
 ships in the release zip as `adb-NOTICE.txt`.
 
 ## Known limits
+
+- **macOS and Linux builds are new** and haven't been tried against an Omni
+  yet. Windows is where square_impact was developed. They're built and
+  smoke-tested on every push, but if you hit a problem on a Mac or Linux
+  machine, please open an issue.
 
 - Developed and tested with **soft putts and chips indoors**. Full-speed swings,
   where the ball leaves the frame within a few frames, haven't been tried.
