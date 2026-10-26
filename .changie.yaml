@@ -34,8 +34,8 @@ envPrefix: CHANGIE_
 # `changie batch` stamps the new version into these files.
 replacements:
   - path: square_impact.py
-    find: '^VERSION = ".*"'
+    find: '^VERSION\s*=\s*".*"'
     replace: 'VERSION = "{{.VersionNoPrefix}}"'
   - path: pyproject.toml
-    find: '^version = ".*"'
+    find: '^version\s*=\s*".*"'
     replace: 'version = "{{.VersionNoPrefix}}"'

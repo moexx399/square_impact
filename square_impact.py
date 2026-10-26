@@ -2937,7 +2937,7 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION ="0.12.1"
+VERSION = "0.14.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

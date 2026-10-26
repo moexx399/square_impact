@@ -562,6 +562,22 @@ class Settings(unittest.TestCase):
             srv.server_close()
 
 
+class Release(unittest.TestCase):
+    def test_version_matches_pyproject_and_changie_can_stamp_it(self):
+        """`changie batch` writes the version into both files by pattern; a line
+        it can't match is silently skipped (0.14.0 shipped tagged with VERSION
+        still 0.12.1 that way), and the release build refuses a mismatch."""
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+            project = re.search(r'^version = "(.*)"$', fh.read(), re.M)
+        with open(os.path.join(root, "square_impact.py"), encoding="utf-8") as fh:
+            code = re.search(r'^VERSION = "(.*)"$', fh.read(), re.M)
+        self.assertTrue(code, 'square_impact.py needs a line exactly like VERSION = "1.2.3"')
+        self.assertTrue(project, 'pyproject.toml needs a line exactly like version = "1.2.3"')
+        self.assertEqual(code[1], si.VERSION)
+        self.assertEqual(project[1], si.VERSION)
+
+
 class Platforms(unittest.TestCase):
     def test_update_asset_names_match_what_the_pipeline_builds(self):
         """`update` downloads square_impact-<release_platform()>.zip; build-exe.yml

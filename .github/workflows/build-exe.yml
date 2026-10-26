@@ -46,7 +46,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           version="${GITHUB_REF_NAME#v}"   # the leading v is optional: v1.2.3 == 1.2.3
-          code=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' square_impact.py)
+          # ask the code itself, so its formatting can't matter (a pattern once read nothing)
+          # (no print(): on Windows its \r\n would leave a \r on the end)
+          code=$(python -c "import square_impact, sys; sys.stdout.write(square_impact.VERSION)")
           if [ "$version" != "$code" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match VERSION $code (run 'changie batch' first)"; exit 1
           fi
