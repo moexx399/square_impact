@@ -374,6 +374,24 @@ class BallCrop(unittest.TestCase):
         self.assertLess(abs(y - 134), 4)
         self.assertIsNone(si.ball_blob(self.scene(stripe=True, shaft=True), W, H))
 
+    def test_low_camera_sees_a_flat_ball_and_it_still_counts(self):
+        # the bottom camera sees the resting ball ~4.5x wider than tall (72x16 px);
+        # it used to be rejected as "too flat", and the crop snapped to the left
+        f = bytearray(frame(0, ball=None))
+        for y in range(126, 142):
+            for x in range(300, 372):
+                if ((x - 336) / 36) ** 2 + ((y - 134) / 8) ** 2 <= 1:
+                    f[y * W + x] = 230
+        x, y = si.ball_blob(bytes(f), W, H)
+        self.assertLess(abs(x - 336), 4)
+        self.assertLess(abs(y - 134), 4)
+
+    def test_crop_starts_on_the_resting_ball_when_it_isnt_tracked_at_first(self):
+        # opening frames: no ball the tracker accepts; later, a blob far to the left
+        frames = [frame(0, ball=None)] * 3 + [frame(1, ball=(60, 120))] * 3
+        self.assertLess(si.ball_path(frames, W, H)[0][0], 100)              # the old snap
+        self.assertEqual(si.ball_path(frames, W, H, rest=(336, 134))[0], (336, 134))
+
     def test_path_fills_frames_without_a_ball(self):
         frames = [frame(0, ball=None), frame(1, ball=(400, 120)), frame(2, ball=None),
                   frame(3, ball=(500, 120)), frame(0, ball=None)]

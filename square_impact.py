@@ -836,6 +836,10 @@ def crop_window(f, w, h, cx, cy, cw, ch):
 
 BLOB_CONTRAST = 60   # a block this much brighter than its row's median is "bright"
 BLOB_MIN_BLOCKS = 4  # smallest blob (in 4x4 blocks) that can be the ball
+# Widest the ball can look, as width / height in blocks: the low, level bottom
+# camera sees the resting ball 4.2-4.5x wider than tall (the top camera ~4);
+# floor markers and reflections are far longer and flatter.
+BLOB_MAX_ASPECT = 6
 
 
 def ball_blob(f, w, h, with_size=False):
@@ -871,9 +875,9 @@ def ball_blob(f, w, h, with_size=False):
                 continue
             ys, xs = [c[0] for c in cells], [c[1] for c in cells]
             width, height = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
-            # the ball reads as an ellipse ~1-3.5x wider than tall; club shafts are
+            # the ball reads as an ellipse ~1-4.5x wider than tall; club shafts are
             # tall and thin, floor markers and reflections long and flat: not the ball
-            if not 0.8 * height <= width <= 4 * height:
+            if not 0.8 * height <= width <= BLOB_MAX_ASPECT * height:
                 continue
             score = len(cells)
             if score > best_score:
@@ -884,24 +888,42 @@ def ball_blob(f, w, h, with_size=False):
     return best if best is None or with_size else best[:2]
 
 
-def ball_path(frames, w, h, board=None):
+def rest_position(frames, w, h):
+    """The ball at rest in the first frames of a clip -> ([x, y] px, contrast vs
+    the floor: ~70-92 for a ball, ~16 for none). Works on the per-block minimum
+    of the first 8 frames, which keeps still things (the ball) and drops moving
+    ones (club highlights), and on brightness against the floor beside it, so
+    the ball's shape doesn't matter."""
+    first = [block_means(f, w, h) for f in frames[:8]]
+    floor_min = [[min(b[y][x] for b in first) for x in range(len(first[0][0]))]
+                 for y in range(len(first[0]))]
+    (bx, by), contrast = find_ball(floor_min)
+    return [bx * BLOCK + 2, by * BLOCK + 2], contrast
+
+
+def ball_path(frames, w, h, board=None, rest=None):
     """Where the ball is in each frame, for the crop to follow, smoothed.
     Frames where it isn't visible (r2's unlit frames, or after it leaves the
     view) are filled in: interpolated between known positions, and held at the
-    first/last position before/after them (rather than panning off into black)."""
+    first/last position before/after them (rather than panning off into black).
+    `rest`: where the ball sits before it's struck (rest_position()), used for
+    the frames before it's first tracked, rather than wherever it's first seen."""
     if not frames:
         return []
     found = [ball_blob(f, w, h, with_size=True) for f in frames]
     sizes = sorted(b[2] for b in found if b)
     if not sizes:
-        return [(w / 2, h / 2)] * len(frames)
+        return [tuple(rest) if rest else (w / 2, h / 2)] * len(frames)
     # the ball is about the same size all clip; a much smaller blob (once the ball
     # has left the view: the club's marker or a glint) isn't it
     typical = sizes[len(sizes) // 2]
     pos = [(b[0], b[1]) if b and b[2] >= 0.4 * typical else None for b in found]
+    if rest and not pos[0]:   # not tracked at the start: it's resting there until it is
+        first = next((i for i, p in enumerate(pos) if p), len(pos))
+        pos[:first] = [tuple(rest)] * first
     known = [i for i, p in enumerate(pos) if p]
     if not known:
-        return [(w / 2, h / 2)] * len(frames)
+        return [tuple(rest) if rest else (w / 2, h / 2)] * len(frames)
     filled = []
     for i in range(len(pos)):
         if pos[i]:
@@ -918,6 +940,15 @@ def ball_path(frames, w, h, board=None):
     n = len(filled)   # light, centred smoothing: steadies the pan without lagging the ball
     return [tuple(sum(p[k] for p in filled[max(0, i - 1):i + 2]) / len(filled[max(0, i - 1):i + 2])
                   for k in (0, 1)) for i in range(n)]
+
+
+def resting_ball(frames, w, h, board):
+    """Where the launch camera's ball rests at the start of a clip, if there's
+    clearly a ball (r2's opening frames are unlit, so it has none)."""
+    if board != "r1" or len(frames) < 2:
+        return None
+    pos, contrast = rest_position(frames, w, h)
+    return pos if contrast >= MIN_BALL_CONTRAST else None
 
 
 def crop_frame(f, w, h, x0, x1):
@@ -1074,12 +1105,7 @@ def find_impact_ordered(frames, w, h):
     ball's flight and returns the frame nearest it. (Block-level tracking was
     not enough: light from the approaching club shifted the ball's block by one
     38 ms before contact.)"""
-    first = [block_means(f, w, h) for f in frames[:8]]
-    floor_min = [[min(b[y][x] for b in first) for x in range(len(first[0][0]))]
-                 for y in range(len(first[0]))]
-    (bx, by), contrast = find_ball(floor_min)
-    rest_px = [bx * BLOCK + 2, by * BLOCK + 2]
-
+    rest_px, contrast = rest_position(frames, w, h)
     c = ball_centroid(frames[0], w, h, *rest_px)
     origin = c
     away = lambda p: ((p[0] - origin[0]) ** 2 + (p[1] - origin[1]) ** 2) ** 0.5
@@ -1475,7 +1501,8 @@ def _display_segments(shot_dir):
             if on_ball:
                 cw, ch = BALL_CROP
                 path = _cached(("ball", shot_dir, cam, lo, hi),
-                               lambda raw=raw, w=w, h=h, b=s["board"]: ball_path(raw, w, h, b))
+                               lambda raw=raw, w=w, h=h, b=s["board"]:
+                                   ball_path(raw, w, h, b, resting_ball(raw, w, h, b)))
                 if DISPLAY_CROP == "ball":
                     path = [path[0]] * len(path)   # where the clip starts, then hold still
                 frames = [crop_window(f, w, h, x, y, cw, ch) for f, (x, y) in zip(frames, path)]
@@ -2937,7 +2964,7 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.14.0"
+VERSION = "0.14.1"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

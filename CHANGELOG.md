@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.14.1 - 2026-10-26
+### Fixed
+* The ball crop no longer snaps to the left edge: the low bottom camera sees the resting ball flatter than the tracker allowed, so it wasn't found at the start of the clip. The flatter ball is now accepted, and the crop falls back to the resting ball the capture finds
+
 ## v0.14.0 - 2026-10-26
 ### Added
 * macOS (Apple Silicon and Intel) and Linux builds: every release now ships square_impact-macos-arm64.zip, square_impact-macos-x64.zip and square_impact-linux-x64.zip next to the Windows zip, each with adb built in, and square_impact update fetches the right one
