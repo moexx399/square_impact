@@ -188,7 +188,7 @@ Source.
 
 | Setting | Group | Default | Allowed | Takes effect | Meaning |
 |---|---|---|---|---|---|
-| `cam` | Capture | top | top / bottom / both | next shot | Which of the launch board's two cameras to capture and show: top (higher up, looking down at the ball), bottom (low and level), or both stacked. |
+| `cam` | Capture | bottom | top / bottom / both | next shot | Which of the launch board's two cameras to capture and show: top (higher up, looking down at the ball), bottom (low and level), or both stacked. |
 | `pad` | Capture | 30 | 5–34 | next shot | Frames saved before and after contact in each clip (500 fps: 30 frames = 60 ms). |
 | `keep_captures` | Capture | 5 | 1–1000 | next shot | Newest shot folders kept in shots/. Older ones are deleted after each new shot. |
 | `min_ball_contrast` | Capture | 40 | 5–150 | next shot | How much brighter than the floor a resting ball must be for a launch-camera event to count as a shot (a ball scores 70-92, an empty floor ~16). Lower it if real shots are ignored in a bright room; raise it if events with no ball get through. |
@@ -197,7 +197,7 @@ Source.
 | `crop` | Display | ball | ball / follow / full / left / right | right away | ball: a 640x192 window centred on the ball where it starts, then held still. follow: the same window panning with the ball. left / right / full: fixed parts of the launch camera's frame. Saved clips always keep the full frame. |
 | `trim_front` | Display | 0.2 | 0–0.45 | right away | Fraction of each clip dropped from the start, where the club is still on its way in. 0 shows everything. |
 | `trim_back` | Display | 0.2 | 0–0.45 | right away | Fraction of each clip dropped from the end, where the ball is flying away. |
-| `denoise` | Display | on | true / false | right away | Average the launch camera's sensor grain out of the still parts of each frame. |
+| `denoise` | Display | off | true / false | right away | Average the launch camera's sensor grain out of the still parts of each frame. |
 | `enhance` | Display | on | true / false | right away | Lift the launch camera's dark scene and sharpen edges (see Image tuning). |
 | `tone_median` | Image tuning | 50 | 10–200 | right away | Where the shadow lift puts a clip's median brightness, for whatever moves (the club, the struck ball). 0-255. |
 | `tone_median_still` | Image tuning | 28 | 5–200 | right away | The same for the still turf and room. Keep it well below the moving value so the club stands out. |
@@ -234,14 +234,14 @@ python square_impact.py version                    version, update check, and th
 square_impact update [--force]                     replace the executable with the latest release
 
 common options:
-  --cam top|bottom|both   which camera (default: top for obs/live/shot)
+  --cam top|bottom|both   which camera (default: bottom for obs/live/shot)
   --crop ball|follow|left|right|full
                           what the overlay and viewers show (default ball: a 640x192
                           window centred on the ball at the start of the clip, then
                           held still; follow: the same window panning with the
                           ball; saved clips always keep the full frame)
-  --no-denoise            show the launch camera's frames as captured (by default
-                          its sensor grain is averaged out, see below)
+  --denoise, --no-denoise average the launch camera's sensor grain out, or don't
+                          (off by default, see below)
   --no-enhance            show the launch camera's frames at their captured
                           brightness (by default shadows are lifted and edges
                           sharpened, see below)
@@ -261,11 +261,12 @@ and save the current frame as PNG.
 ### Image quality
 
 The launch camera runs at high gain for its 500 fps, so its frames are grainy.
-By default the overlay and viewers **average each pixel with the same pixel in
-the frames around it, where it isn't changing**: the still floor gets smoothed
-(noise drops from ~5.8 to ~2.6 grey levels) while the moving club and ball stay
-sharp. It runs across several CPU cores (~0.3 s per shot). `--no-denoise`
-turns it off. The spin camera's strobe-lit frames are clean already.
+Turn on **denoise** (on the settings page, or `--denoise`) and the overlay and
+viewers **average each pixel with the same pixel in the frames around it, where
+it isn't changing**: the still floor gets smoothed (noise drops from ~5.8 to
+~2.6 grey levels) while the moving club and ball stay sharp. It runs across
+several CPU cores (~0.3 s per shot). It's off by default. The spin camera's
+strobe-lit frames are clean already.
 
 The launch camera's scene is also **very dark**: half the pixels sit at 14/255
 or below, and only the ball and the club's edges are bright, so the shaft, the

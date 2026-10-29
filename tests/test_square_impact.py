@@ -100,6 +100,21 @@ class ContactDetection(unittest.TestCase):
         t, _, _ = si.find_impact_ordered(self.fast_shot(35.2), W, H)
         self.assertEqual(t, 35)
 
+    def test_driver_ball_that_leaves_the_view_at_once_is_not_seen_late(self):
+        # off a tee at driver speed the ball climbs out of the 192-px-tall view
+        # within 2 frames, too soon to be "seen moving away for 3"; contact used
+        # to be found 13-15 frames late, so the replay showed the ball on the tee
+        def driver(launch, speed=300, climb=90):
+            out = []
+            for t in range(61):
+                dt = max(0.0, t - launch)
+                x, y = round(REST[0] + dt * speed), round(REST[1] - dt * climb)
+                out.append(frame(t, (x, y) if y > -10 and x < W + 20 else None))
+            return out
+        for launch, want in ((30.2, 30), (30.7, 31)):
+            t, _, _ = si.find_impact_ordered(driver(launch), W, H)
+            self.assertEqual(t, want, launch)
+
     def test_ball_faster_than_the_tracking_window_is_not_seen_late(self):
         # 30 px/frame jumps out of the centroid window; this used to be detected
         # two frames late
@@ -516,14 +531,14 @@ class Settings(unittest.TestCase):
         self.assertEqual(si.setting("trim_front"), 0.2)   # untouched: the default
 
     def test_bad_entries_are_reported_and_ignored(self):
-        self.write({"pad": "lots", "crop": "sideways", "tone_median": 999, "colour": "red", "denoise": False})
+        self.write({"pad": "lots", "crop": "sideways", "tone_median": 999, "colour": "red", "denoise": True})
         warnings = si.load_settings()
         self.assertEqual(len(warnings), 4)
         self.assertEqual(si.CAPTURE_PAD, 30)
-        self.assertFalse(si.DISPLAY_DENOISE)               # the valid one still applies
+        self.assertTrue(si.DISPLAY_DENOISE)                # the valid one still applies
         self.write("{ not json")
         self.assertEqual(len(si.load_settings()), 1)
-        self.assertTrue(si.DISPLAY_DENOISE)
+        self.assertEqual(si.DISPLAY_DENOISE, si.SETTING["denoise"]["default"])
 
     def test_save_validates_then_writes_and_applies(self):
         self.write({"comment": "kept", "pad": 20})

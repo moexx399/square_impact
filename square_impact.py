@@ -1101,31 +1101,46 @@ def find_impact_ordered(frames, w, h):
     rest that wanders < 0.5 px, once struck it moves 3+ px per frame (100+ on a
     full swing, when it's picked up again from a whole-frame search). The ball
     has left its spot at the first frame it's >= 2 px from rest and moving
-    steadily away for 3 frames; contact_frame() then times the launch from the
-    ball's flight and returns the frame nearest it. (Block-level tracking was
-    not enough: light from the approaching club shifted the ball's block by one
-    38 ms before contact.)"""
+    steadily away for 3 frames, or, sooner, when its spot is empty for 2 frames
+    running: a driver off a tee leaves the camera's 192-px-tall view within a
+    frame or two, too soon to be seen moving away for 3. contact_frame() then
+    times the launch from the ball's flight and returns the frame nearest it.
+    (Block-level tracking was not enough: light from the approaching club
+    shifted the ball's block by one 38 ms before contact.)"""
     rest_px, contrast = rest_position(frames, w, h)
+    sx, sy = (rest_px[0] - 2) // BLOCK, (rest_px[1] - 2) // BLOCK
+    top = (sy - 1) * BLOCK   # just the 3 block rows around the spot: all find_ball looks at there
+
+    def spot_contrast(f):
+        """How much the rest spot stands out from the floor beside it: the
+        ball's contrast while it's there, about none once it's gone."""
+        band = block_means(f[top * w:(top + 3 * BLOCK) * w], w, 3 * BLOCK)
+        return find_ball(band, near=(sx, 1), reach=(0, 0))[1]
+
+    gone = [contrast >= MIN_BALL_CONTRAST and 1 <= sy < h // BLOCK - 1 and
+            spot_contrast(f) < SPOT_EMPTY * contrast for f in frames]
     c = ball_centroid(frames[0], w, h, *rest_px)
     origin = c
     away = lambda p: ((p[0] - origin[0]) ** 2 + (p[1] - origin[1]) ** 2) ** 0.5
     rest_blob = ball_blob(frames[0], w, h, with_size=True)
     dist = []
-    for f in frames:
+    for f, empty in zip(frames, gone):
         c = ball_centroid(f, w, h, int(c[0]), int(c[1]))
         # a struck ball can jump further in one frame than the centroid window
-        # reaches; then pick it up again from a search of the whole frame
-        b = rest_blob and ball_blob(f, w, h, with_size=True)
+        # reaches; then pick it up again from a search of the whole frame (only
+        # once it may have left its spot: while it rests, that search is wasted)
+        b = rest_blob and (empty or away(c) >= 2) and ball_blob(f, w, h, with_size=True)
         if b and b[2] >= 0.5 * rest_blob[2] and away(b) > away(c) + 6:
             c = ball_centroid(f, w, h, int(b[0]), int(b[1]))
         dist.append(away(c))
     for t in range(1, len(frames) - 2):
-        if dist[t] >= 2 and dist[t] < dist[t + 1] < dist[t + 2]:
+        if (dist[t] >= 2 and dist[t] < dist[t + 1] < dist[t + 2]) or (gone[t] and gone[t + 1]):
             return contact_frame(frames, w, h, origin, t), rest_px, contrast
     return None, rest_px, contrast
 
 
-CONTACT_LEAD = 0.1   # frames: club-ball contact starts ~0.2 ms before the launch extrapolated from flight
+SPOT_EMPTY = 0.4     # rest spot standing out less than this fraction of the ball's contrast: ball gone
+CONTACT_LEAD = 0.1  # frames: club-ball contact starts ~0.2 ms before the launch extrapolated from flight
 
 
 def contact_frame(frames, w, h, origin, moved):
@@ -1256,7 +1271,7 @@ def status():
 
 # ---------------------------------------------------------------- display pipeline
 
-DISPLAY_DENOISE = True  # set from --no-denoise
+DISPLAY_DENOISE = False  # set from settings: denoise (--denoise / --no-denoise)
 
 
 _POOL = None
@@ -2244,9 +2259,10 @@ async function renderPreview() {
     const ab = await r.arrayBuffer();
     if (my !== pvReq) return;
     const n = new DataView(ab).getUint32(0);
-    pv = { header: JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 4, n))),
-           buf: new Uint8Array(ab, 4 + n) };
-    buildTimeline(false);
+    const header = JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 4, n)));
+    const newShot = !pv || pv.header.name !== header.name;
+    pv = { header, buf: new Uint8Array(ab, 4 + n) };
+    buildTimeline(newShot);                   // a different shot starts from its first frame
     $('pvStatus').textContent = 'rendered in ' + ((performance.now() - t) / 1000).toFixed(1) + ' s';
   } catch (e) {
     if (e.name !== 'AbortError' && my === pvReq) $('pvStatus').textContent = 'Preview failed: ' + e.message;
@@ -2274,7 +2290,7 @@ function buildTimeline(restart) {
   player.tl = tl;
   player.loopMs = Math.max(1, t + (+valueOf('gap') || 0));
   player.t0 = performance.now() - (restart ? 0 : Math.min(pos, player.loopMs - 1));
-  player.idx = Math.min(player.idx, tl.length - 1);
+  player.idx = restart ? 0 : Math.min(player.idx, tl.length - 1);
   player.last = -1;                           // redraw: frames, size or brightness changed
 }
 
@@ -2282,7 +2298,7 @@ const cv = $('pv'), ctx = cv.getContext('2d');
 let img = null, px = null;
 function draw(i) {
   const e = player.tl[i];
-  if (!e) return;
+  if (!e || !pv) return;
   if (cv.width !== e.g.w || cv.height !== e.g.h || !img) {
     cv.width = e.g.w; cv.height = e.g.h;
     img = ctx.createImageData(e.g.w, e.g.h); px = new Uint32Array(img.data.buffer);
@@ -2296,16 +2312,15 @@ function draw(i) {
 }
 
 function tick() {
-  if (player.tl.length) {
-    if (!player.paused) {
-      const lt = (performance.now() - player.t0) % player.loopMs;
-      let i = 0;
-      while (i + 1 < player.tl.length && player.tl[i + 1].start <= lt) i++;
-      player.idx = i;
-    }
-    if (player.idx !== player.last) { draw(player.idx); player.last = player.idx; }
+  requestAnimationFrame(tick);   // first, so an error drawing one frame can't stop playback for good
+  if (!player.tl.length || !pv) return;
+  if (!player.paused) {
+    const lt = (performance.now() - player.t0) % player.loopMs;
+    let i = 0;
+    while (i + 1 < player.tl.length && player.tl[i + 1].start <= lt) i++;
+    player.idx = i;
   }
-  requestAnimationFrame(tick);
+  if (player.idx !== player.last) { player.last = player.idx; draw(player.idx); }
 }
 requestAnimationFrame(tick);
 
@@ -2320,7 +2335,7 @@ const step = d => { setPaused(true); const n = player.tl.length;
                     if (n) player.idx = (player.idx + d + n) % n; };
 $('pvPrev').onclick = () => step(-1);
 $('pvNext').onclick = () => step(1);
-$('pvShot').onchange = () => { pv = null; renderPreview(); };
+$('pvShot').onchange = () => renderPreview();   // the current clip keeps playing until the new one arrives
 
 async function initPreview() {
   const r = await fetch('/api/shots', { cache: 'no-store' });
@@ -2662,7 +2677,7 @@ def obs(cams, pad, port):
 # the script), and edited on the settings page (http://localhost:8765/settings).
 # Precedence: built-in default < the file < a command-line flag.
 CONFIG_PATH = os.path.join(HERE, "square_impact.json")
-CAPTURE_CAM = "top"     # set from settings: cam
+CAPTURE_CAM = "bottom"  # set from settings: cam
 CAPTURE_PAD = 30        # set from settings: pad
 OVERLAY_PORT = 8765     # set from settings: port
 UPDATE_CHECK = True     # set from settings: update_check
@@ -2675,7 +2690,7 @@ def _setting(key, group, kind, default, label, help, attr=None, applies="live", 
 
 
 SETTINGS = [
-    _setting("cam", "Capture", "choice", "top", "Launch camera",
+    _setting("cam", "Capture", "choice", "bottom", "Launch camera",
              "Which of the launch board's two cameras to capture and show: top (higher up, "
              "looking down at the ball), bottom (low and level), or both stacked.",
              "CAPTURE_CAM", "next shot", choices=["top", "bottom", "both"]),
@@ -2709,7 +2724,7 @@ SETTINGS = [
     _setting("trim_back", "Display", "float", 0.2, "Trim end",
              "Fraction of each clip dropped from the end, where the ball is flying away.",
              "DISPLAY_TRIM_BACK", min=0, max=0.45, step=0.05),
-    _setting("denoise", "Display", "bool", True, "Denoise",
+    _setting("denoise", "Display", "bool", False, "Denoise",
              "Average the launch camera's sensor grain out of the still parts of each frame.",
              "DISPLAY_DENOISE"),
     _setting("enhance", "Display", "bool", True, "Enhance",
@@ -2964,7 +2979,7 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.14.1"
+VERSION = "0.15.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
@@ -3265,7 +3280,7 @@ def main():
     ap.add_argument("--range", metavar="A:B", help="sample: only buffers A..B-1 (e.g. 120:150)")
     ap.add_argument("--cam", choices=["0", "1", "top", "bottom", "both"], default=None,
                     help="0/top (upper, tilted down) or 1/bottom (lower, level); "
-                         "default top for live/shot, both otherwise")
+                         "default bottom for obs/live/shot (see settings), both otherwise")
     ap.add_argument("--pad", type=int, help="frames kept before/after impact (30)")
     ap.add_argument("--port", type=int, help="obs/settings: web server port (8765)")
     ap.add_argument("--trim-front", type=float, metavar="FRACTION",
@@ -3280,6 +3295,9 @@ def main():
                          "on the ball at the start of the clip, then held still (default); follow = "
                          "the same window panning with the ball; left/right/full = fixed parts "
                          "of the launch camera's frame. Saved clips keep the full frame")
+    ap.add_argument("--denoise", action="store_true",
+                    help="average the launch camera's sensor grain out of the still parts of each "
+                         "frame (off by default)")
     ap.add_argument("--no-denoise", action="store_true",
                     help="show the launch camera's frames as captured, without the "
                          "frame-averaging denoise")
@@ -3318,8 +3336,8 @@ def cli_overrides(a):
            "crop": a.crop}
     if a.cam and a.cmd in ("obs", "live", "shot"):   # grab/sample take --cam for themselves
         cli["cam"] = {"0": "top", "1": "bottom"}.get(a.cam, a.cam)
-    if a.no_denoise:
-        cli["denoise"] = False
+    if a.denoise or a.no_denoise:
+        cli["denoise"] = a.denoise and not a.no_denoise
     if a.no_enhance:
         cli["enhance"] = False
     if a.no_update_check:

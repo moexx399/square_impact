@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.15.0 - 2026-10-29
+### Changed
+* New defaults: the bottom launch camera (was top) and denoise off (was on). Set cam: top or denoise: true on the settings page to go back; --denoise turns denoise on for one run
+### Fixed
+* Settings page preview: picking a different saved shot froze the preview until the page was reloaded. The current clip now keeps playing while the new one renders, the new shot starts from its first frame, and playback can no longer stop on a drawing error
+* Driver shots: a ball that leaves the camera's view within a frame or two (a driver off a tee) was found 13-15 frames late, so the replay showed the ball sitting on the tee. Contact now also counts the ball's spot going empty
+
 ## v0.14.1 - 2026-10-26
 ### Fixed
 * The ball crop no longer snaps to the left edge: the low bottom camera sees the resting ball flatter than the tracker allowed, so it wasn't found at the start of the clip. The flatter ball is now accepted, and the crop falls back to the resting ball the capture finds
