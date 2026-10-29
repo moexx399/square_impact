@@ -17,6 +17,15 @@ straight out of the camera board's memory over USB, a few seconds after each
 shot, and shows them as a slow-motion clip. You can watch it in a desktop
 viewer or as a pop-up overlay in OBS.
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Slow-motion replay of a pitch shot from the Square Omni's launch camera: the club comes in, strikes the ball, and the ball flies off to the right" width="640">
+  <br>
+  <sub>A real pitch, exactly as the overlay shows it: 37 frames from the Omni's
+  launch camera at 500 fps (74 ms of real time), slowed down about 17×, pausing
+  on the moment of contact. The Omni measured it at 17.7 m/s ball speed, 38.7°
+  launch and 4,620 rpm of spin.</sub>
+</p>
+
 > **Use at your own risk. This software comes with no warranty of any kind.**
 > It's unofficial and not affiliated with or endorsed by Square. It reads the
 > device through its debug interface and **never writes anything to it** (see

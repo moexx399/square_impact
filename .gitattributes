@@ -4,3 +4,4 @@
 *.pgm binary
 *.exe binary
 *.dll binary
+*.gif binary
