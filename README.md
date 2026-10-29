@@ -34,7 +34,20 @@ viewer or as a pop-up overlay in OBS.
 
 ## Quick start
 
-**Easiest:** download the zip for your computer from the GitHub Releases page
+**macOS and Linux, with [Homebrew](https://brew.sh):**
+
+```bash
+brew install moexx399/tap/square_impact
+```
+
+Homebrew installs the right build for your computer, and `brew upgrade` keeps it
+up to date (`square_impact update` points you there). Shots and settings are kept
+in your user data folder (`~/Library/Application Support/square_impact` on
+macOS, `~/.local/share/square_impact` on Linux) rather than next to the program.
+Homebrew downloads aren't blocked by macOS's Gatekeeper; on Linux, add the udev
+rule below.
+
+**Or download** the zip for your computer from the GitHub Releases page
 (or from the latest `build-exe` workflow run). Each contains a single executable
 with `adb` built in, so no Python or Android tools are needed:
 
@@ -457,7 +470,32 @@ On a version tag (`git tag v0.1.0 && git push --tags`), a final job checks the
 tag matches `VERSION` and publishes all four zips as one GitHub Release. The zip
 names are what `square_impact update` looks for (`release_platform()`).
 
-To build locally, do the same by hand:
+### Homebrew tap
+
+After publishing a release, the workflow's `homebrew` job writes the formula
+for it with `packaging/homebrew/formula.py` (the macOS and Linux zips' URLs and
+SHA-256 checksums) and pushes it to the tap repository as
+`Formula/square_impact.rb`, so `brew upgrade` finds the new version. One-time
+setup:
+
+1. Create a public GitHub repository named **`homebrew-tap`** under the same
+   account (`moexx399/homebrew-tap`; Homebrew drops the `homebrew-` prefix, so
+   users type `moexx399/tap`). To use another name, set a repository variable
+   `HOMEBREW_TAP` to `owner/repo`.
+2. Create a fine-grained personal access token with **Contents: read and
+   write** on that repository only.
+3. In this repository, add it as an Actions secret named
+   **`HOMEBREW_TAP_TOKEN`** (Settings → Secrets and variables → Actions).
+
+Until the secret exists, the job still writes the formula and attaches it to
+the run as the `homebrew-formula` artifact, with a warning, and the release
+itself is unaffected. To write one by hand from a release's zips:
+
+```bash
+python packaging/homebrew/formula.py --version 1.2.3 --tag 1.2.3 --dist DIR
+```
+
+To build locally, do the same as the workflow by hand:
 
 ```bash
 pip install pyinstaller

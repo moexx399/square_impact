@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.16.0 - 2026-10-29
+### Added
+* Homebrew: brew install moexx399/tap/square_impact on macOS and Linux. Each release updates the tap's formula automatically; Homebrew installs keep shots and settings in the user data folder and update with brew upgrade
+
 ## v0.15.0 - 2026-10-29
 ### Changed
 * New defaults: the bottom launch camera (was top) and denoise off (was on). Set cam: top or denoise: true on the settings page to go back; --denoise turns denoise on for one run

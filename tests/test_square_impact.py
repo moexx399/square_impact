@@ -611,6 +611,50 @@ class Release(unittest.TestCase):
         self.assertEqual(project[1], si.VERSION)
 
 
+class Homebrew(unittest.TestCase):
+    def formula_module(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..", "packaging", "homebrew", "formula.py")
+        spec = importlib.util.spec_from_file_location("formula", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_formula_points_at_this_releases_zips(self):
+        f = self.formula_module()
+        shas = {"macos_arm": "a" * 64, "macos_intel": "b" * 64, "linux_intel": "c" * 64}
+        rb = f.formula("v1.2.3", "v1.2.3", shas)
+        self.assertIn('version "1.2.3"', rb)
+        base = "https://github.com/moexx399/square_impact/releases/download/v1.2.3/"
+        for key, zip_name in f.ZIPS.items():
+            self.assertIn(f'url "{base}{zip_name}"\n      sha256 "{shas[key]}"', rb)
+        self.assertIn('bin.install "square_impact"', rb)
+        body = re.sub(r"<<~EOS\n.*?\n\s*EOS\n", "\n", rb, flags=re.S)   # Ruby outside the heredocs
+        code = [ln.strip() for ln in body.splitlines()]
+        opens = sum(ln.startswith(("class ", "def ", "if ")) or ln.endswith(" do") for ln in code)
+        self.assertEqual(opens, sum(ln == "end" for ln in code))   # every block is closed
+        with self.assertRaises(ValueError):
+            f.formula("1.2.3", "1.2.3", {"macos_arm": "a" * 64})
+
+    def test_formula_zips_are_the_ones_the_pipeline_builds(self):
+        f = self.formula_module()
+        self.assertEqual(set(f.ZIPS.values()),
+                         {"square_impact-macos-arm64.zip", "square_impact-macos-x64.zip",
+                          "square_impact-linux-x64.zip"})
+        self.assertEqual(f.REPO, si.REPO)
+
+    def test_homebrew_install_keeps_data_in_the_user_folder_and_lets_brew_update(self):
+        import contextlib
+        import io
+        from unittest import mock
+        with mock.patch.object(si, "FROZEN", True), mock.patch.object(si, "HOMEBREW", True):
+            notice = si.update_notice({"tag": "99.0.0", "url": "u"})
+            self.assertIn("brew upgrade square_impact", notice)
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+                si.self_update()
+            self.assertIn("brew upgrade", str(e.exception))
+
+
 class Platforms(unittest.TestCase):
     def test_update_asset_names_match_what_the_pipeline_builds(self):
         """`update` downloads square_impact-<release_platform()>.zip; build-exe.yml

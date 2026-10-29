@@ -99,7 +99,14 @@ def data_dir():
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(base, "square_impact")
-SHOTS_DIR = os.path.join(HERE, "shots")
+
+
+# Installed with Homebrew: the executable lives in Homebrew's Cellar, which
+# Homebrew manages and replaces on every upgrade, so shots and settings live in
+# the per-user data folder instead, and Homebrew does the updating.
+HOMEBREW = FROZEN and not WINDOWS and f"{os.sep}Cellar{os.sep}" in os.path.realpath(sys.executable)
+USER_DIR = data_dir() if HOMEBREW else HERE   # shots/ and square_impact.json
+SHOTS_DIR = os.path.join(USER_DIR, "shots")
 KEEP_CAPTURES = 5   # older capture folders in shots/ are deleted after each save
 
 
@@ -2676,7 +2683,7 @@ def obs(cams, pad, port):
 # Every setting can be overridden from square_impact.json next to the exe (or
 # the script), and edited on the settings page (http://localhost:8765/settings).
 # Precedence: built-in default < the file < a command-line flag.
-CONFIG_PATH = os.path.join(HERE, "square_impact.json")
+CONFIG_PATH = os.path.join(USER_DIR, "square_impact.json")
 CAPTURE_CAM = "bottom"  # set from settings: cam
 CAPTURE_PAD = 30        # set from settings: pad
 OVERLAY_PORT = 8765     # set from settings: port
@@ -2979,7 +2986,7 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
@@ -3129,8 +3136,9 @@ def update_notice(release):
         return None
     new, ours = parse_version(release["tag"]), parse_version(VERSION)
     if new and ours and new > ours:
+        how = "brew upgrade square_impact" if HOMEBREW else f"{EXE_NAME} update"
         return (f"Update available: {VERSION} -> {release['tag'].lstrip('v')}   "
-                f"run '{EXE_NAME} update' or see {release['url']}")
+                f"run '{how}' or see {release['url']}")
     return None
 
 
@@ -3191,6 +3199,8 @@ def self_update(force=False):
 
     if not FROZEN:
         sys.exit(f"running from source: update with `git pull` (self-update is for {EXE_NAME})")
+    if HOMEBREW:
+        sys.exit("installed with Homebrew: update with `brew upgrade square_impact`")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": f"square_impact/{VERSION}"}
     try:
         with urllib.request.urlopen(urllib.request.Request(LATEST_RELEASE_API, headers=headers),

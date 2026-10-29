@@ -1,6 +1,6 @@
 [project]
 name = "square_impact"
-version = "0.15.0"
+version = "0.16.0"
 description = "Instant high-speed replays from the Square Omni launch monitor's own cameras"
 readme = "README.md"
 license = "MIT"
