@@ -100,6 +100,28 @@ class ContactDetection(unittest.TestCase):
         t, _, _ = si.find_impact_ordered(self.fast_shot(35.2), W, H)
         self.assertEqual(t, 35)
 
+    def test_rest_position_off_centre_does_not_look_like_the_ball_moving(self):
+        # on a teed ball the best-scoring block is ~15 px below the ball's centre.
+        # Tracking from there crept up to the centre over the first frames, which
+        # looked like the ball moving: contact fired ~37 frames early on real drivers
+        from unittest import mock
+        real = si.find_ball
+
+        def low(B, near=None, reach=(12, 3)):
+            pos, score = real(B, near, reach)
+            return (pos if near else (pos[0], pos[1] + 2)), score
+        with mock.patch.object(si, "find_ball", low):
+            t, rest, _ = si.find_impact_ordered(shot_frames(contact=35), W, H)
+        self.assertEqual(t, 35)
+        self.assertLessEqual(abs(rest[1] - REST[1]), 2)
+
+    def test_contact_is_not_accepted_before_earliest(self):
+        # a ball that seems to move early (a false trigger) is ignored with a limit
+        frames = [frame(t, (REST[0] + (t * 3 if 2 <= t <= 5 else 0), REST[1])) for t in range(30)]
+        frames += [frame(t, (REST[0] + (t - 35) * 20 if t > 35 else REST[0], REST[1])) for t in range(30, 50)]
+        self.assertLess(si.find_impact_ordered(frames, W, H)[0], 10)
+        self.assertEqual(si.find_impact_ordered(frames, W, H, earliest=25)[0], 35)
+
     def test_driver_ball_that_leaves_the_view_at_once_is_not_seen_late(self):
         # off a tee at driver speed the ball climbs out of the 192-px-tall view
         # within 2 frames, too soon to be "seen moving away for 3"; contact used
@@ -470,6 +492,19 @@ class Enhance(unittest.TestCase):
         self.assertEqual(out[w], still[flat[w]])     # turf: the gentle curve
         self.assertEqual(out[w + 3], moving[si.sharpen(frames[4], w, h)[w + 3]])   # club: the full lift
         self.assertGreater(out[w + 3] / max(1, out[w + 4]), moving[60] / moving[14])   # stands out more
+
+    def test_turf_the_ball_leaves_behind_is_not_lifted_into_a_ghost(self):
+        # the ball rests on a spot for most of the clip, so the median background
+        # there is the ball; once it's gone, that turf must match the turf around it
+        w, h = 400, 3
+        turf = bytes([8, 10, 12, 14, 14, 16, 18, 20] * (w * h // 8))
+        with_ball = bytearray(turf)
+        for x in range(100, 140):
+            with_ball[w + x] = 200
+        frames = [bytes(with_ball)] * 6 + [turf] * 3
+        still, _ = si.tone_curves(frames)
+        out = si.enhance(frames, w, h, parallel=False)[8]
+        self.assertEqual(out[w + 120], still[si.sharpen(turf, w, h)[w + 120]])
 
     def test_single_frame_without_background_counts_as_moving(self):
         f = bytes([8, 14, 40, 255] * 6)

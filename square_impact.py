@@ -420,6 +420,7 @@ def read_frames(lay, idxs, cams=(0, 1), wait_shot=False):
 FETCH_BEFORE = 40   # frames fetched before sqocam's event buffer F
 FETCH_AFTER = 30    # frames fetched after F
 CONTACT_BEFORE_F = 4  # fallback when the ball isn't seen moving
+CONTACT_SEARCH = 15   # contact is 1-5 frames before F on real shots: not accepted earlier than this
 MIN_BALL_CONTRAST = 40  # resting ball scores 70-92 vs floor; empty floor ~16
 
 
@@ -660,7 +661,8 @@ def r1_segment(lay, cap, pad):
     return the contact +-pad frames as a segment."""
     w, h, n = lay["w"], lay["h"], len(cap["buffers"])
     cams = list(cap["frames"])
-    t_imp, rest, contrast = find_impact_ordered(cap["frames"][cams[0]], w, h)
+    t_imp, rest, contrast = find_impact_ordered(cap["frames"][cams[0]], w, h,
+                                                earliest=FETCH_BEFORE - CONTACT_SEARCH)
     if contrast < MIN_BALL_CONTRAST:
         raise NoBall(f"r1: ignored sqocam event at buffer {cap['event']}: no ball in view "
                      f"(contrast {contrast:.0f} < {MIN_BALL_CONTRAST})")
@@ -905,7 +907,18 @@ def rest_position(frames, w, h):
     floor_min = [[min(b[y][x] for b in first) for x in range(len(first[0][0]))]
                  for y in range(len(first[0]))]
     (bx, by), contrast = find_ball(floor_min)
-    return [bx * BLOCK + 2, by * BLOCK + 2], contrast
+    x, y = bx * BLOCK + 2, by * BLOCK + 2
+    if contrast >= MIN_BALL_CONTRAST and len(frames) >= 2:
+        # That's the best-scoring block, which can be well off centre: 15 px low on
+        # a ball on a tee. Settle on its centre, on the frames' per-pixel minimum.
+        still = bytes(map(min, *frames[:8]))
+        for _ in range(8):
+            nx, ny = ball_centroid(still, w, h, int(x), int(y))
+            settled = abs(nx - x) < 1 and abs(ny - y) < 1
+            x, y = nx, ny
+            if settled:
+                break
+    return [round(x), round(y)], contrast
 
 
 def ball_path(frames, w, h, board=None, rest=None):
@@ -1098,9 +1111,10 @@ def find_ball(B, near=None, reach=(12, 3)):
     return pos, best
 
 
-def find_impact_ordered(frames, w, h):
+def find_impact_ordered(frames, w, h, earliest=1):
     """Frames in time order -> (contact frame or None, ball rest position in px,
-    rest ball contrast vs the floor: ~70-92 for a ball, ~16 for none).
+    rest ball contrast vs the floor: ~70-92 for a ball, ~16 for none). Contact
+    isn't looked for before frame `earliest`.
 
     The ball at rest is found on the per-block minimum of the first 8 frames,
     which keeps static objects (the ball) and drops moving ones (club
@@ -1124,7 +1138,7 @@ def find_impact_ordered(frames, w, h):
         band = block_means(f[top * w:(top + 3 * BLOCK) * w], w, 3 * BLOCK)
         return find_ball(band, near=(sx, 1), reach=(0, 0))[1]
 
-    gone = [contrast >= MIN_BALL_CONTRAST and 1 <= sy < h // BLOCK - 1 and
+    gone = [contrast >= MIN_BALL_CONTRAST and 1 <= sy < h // BLOCK - 1 and 14 <= sx < w // BLOCK - 14 and
             spot_contrast(f) < SPOT_EMPTY * contrast for f in frames]
     c = ball_centroid(frames[0], w, h, *rest_px)
     origin = c
@@ -1140,7 +1154,7 @@ def find_impact_ordered(frames, w, h):
         if b and b[2] >= 0.5 * rest_blob[2] and away(b) > away(c) + 6:
             c = ball_centroid(f, w, h, int(b[0]), int(b[1]))
         dist.append(away(c))
-    for t in range(1, len(frames) - 2):
+    for t in range(max(1, earliest), len(frames) - 2):
         if (dist[t] >= 2 and dist[t] < dist[t + 1] < dist[t + 2]) or (gone[t] and gone[t + 1]):
             return contact_frame(frames, w, h, origin, t), rest_px, contrast
     return None, rest_px, contrast
@@ -1423,7 +1437,11 @@ def _enhance_span(frames, w, h, background, still, moving, tune):
         o = bytearray(len(s))
         span = max(1, hi - lo)
         for i, (v, raw, b) in enumerate(zip(s, f, background)):
-            d = raw - b if raw > b else b - raw   # motion judged on the unsharpened pixel
+            # Motion judged on the unsharpened pixel, and only brighter than the
+            # background: the ball rests in one spot for half a clip, so there the
+            # "background" is the ball, and the bare turf it leaves behind would
+            # get the full lift and show as a ghost of the ball.
+            d = raw - b
             if d <= lo:
                 o[i] = still[v]
             elif d >= hi:
@@ -2986,7 +3004,7 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",

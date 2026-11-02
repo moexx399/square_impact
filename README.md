@@ -297,7 +297,7 @@ club and the room barely show. After denoising, the overlay and viewers
 the highlights, so the ball keeps its shading instead of clipping. The lift is
 **motion-aware**. The club only shows as its bright edges (its dark body is as
 dark as the turf), so lifting everything alike would bring the turf up to the
-club. So whatever moves, compared with the clip's still background, gets the
+club. So whatever moves and is brighter than the clip's still background gets the
 full lift (the clip's median brightness at 50/255), while the still turf and room
 get a gentler one (28/255): visible, but well below the club. A clip that's
 bright already isn't darkened.
