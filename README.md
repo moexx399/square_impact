@@ -35,6 +35,7 @@ viewer or as a pop-up overlay in OBS.
 > [License](#license).
 
 **Contents:** [Quick start](#quick-start) · [OBS overlay](#obs-overlay-options) ·
+[Pureplay mode](#pureplay-mode) ·
 [Commands](#commands) · [Output](#output) · [How it works](#how-it-works) ·
 [Building](#building-the-executables) · [Known limits](#known-limits) ·
 [Contributing](#contributing) · [Changelog](CHANGELOG.md)
@@ -163,6 +164,47 @@ within a few seconds and the next shot plays.
 the latest shot's moment of impact (see [Output](#output)). Use it in a second
 Browser Source if you want the still on screen next to the replay.
 
+## Pureplay mode
+
+If you play in [Pureplay](https://github.com/PureplayGolf/Pureplay-Accessory),
+square_impact can follow the round through Pureplay's Accessory API and tag each
+replay with **who hit it, the hole, the shot number and the club**, then the
+**result** once the ball is at rest (where it finished, carry, total, distance
+to the pin).
+
+1. In Pureplay, open **Settings > Accessories** and set **Allow apps from** to
+   **This PC** (or **Your network** if Pureplay runs on another PC; then set
+   `pureplay_host` to that PC's address).
+2. Turn on **Pureplay mode** on the [settings page](#settings), or add
+   `--pureplay` to `obs`, `live` or `shot`.
+3. The first time, Pureplay asks you to approve **square_impact**. Approve it
+   once; the pairing token is saved (`pureplay.json` in the per-user data folder,
+   e.g. `%LOCALAPPDATA%\square_impact` on Windows) and later runs connect without
+   asking.
+
+Check the link before a session with `square_impact pureplay`: it pairs and
+prints Pureplay's events as they happen.
+
+- **Matching.** Pureplay doesn't know about the Omni's cameras, so each capture is
+  matched to the Pureplay shot launched closest in time to the Omni logging it
+  (within `pureplay_match_window`, 8 s by default), with ball speed as a
+  tie-breaker. Captures with no match still show, just without the card.
+- **On the overlay** (`pp_card`, on by default) the replay shows
+  *Joe · Hole 7 · Shot 2 · 7 Iron* in the top-left corner. When Pureplay
+  reports the result, a card such as *Green · carry 151 yd · total 159 yd ·
+  7 ft to the pin* shows for `pp_result` ms (6 s), even if the replay has already
+  hidden. Mulligans are marked on the card.
+- **Saved shots** are named after the Pureplay shot
+  (`…_shot_r1+r2_H7S2_Joe`) and their `meta.json` has a `pureplay` block with
+  the player, hole, stroke, club, Pureplay's launch numbers and the result. The
+  desktop viewers show the same line under the frame.
+- **Read-only.** square_impact never sends Pureplay a command: it can't change
+  aim or club, whatever access it's granted. If you remove it in Pureplay's
+  Settings > Accessories, it asks to pair again; if you deny it, it stops asking
+  until you restart it.
+- Run it on the PC that's **hosting** the round. On a PC that joined someone
+  else's round, Pureplay doesn't publish shots, so nothing gets tagged.
+
 ## Settings
 
 Every setting can be changed in **`square_impact.json` next to the exe** (or
@@ -237,6 +279,13 @@ Source.
 | `fade` | OBS overlay | 300 | 0–3000 | right away | Fade in/out (ms) |
 | `gain` | OBS overlay | 1.0 | 0.2–4 | right away | Multiplies every pixel's brightness in the overlay. |
 | `info` | OBS overlay | off | true / false | right away | Overlay ball speed, launch, direction and spin from the Omni's own log. |
+| `pp_card` | OBS overlay | on | true / false | right away | In Pureplay mode: show who hit the shot, the hole, shot number and club over the replay. |
+| `pp_result` | OBS overlay | 6000 | 0–30000 | right away | In Pureplay mode: how long the shot's result shows once the ball is at rest (ms), even if the replay has already hidden. 0 to never show it. |
+| `pureplay` | Pureplay | off | true / false | restart | [Pureplay mode](#pureplay-mode): tag each replay with the Pureplay round's player, hole, shot and club, then the result. |
+| `pureplay_host` | Pureplay | 127.0.0.1 | host name or IP | restart | The PC running Pureplay. |
+| `pureplay_port` | Pureplay | 9770 | 1–65535 | restart | Port shown in Pureplay's Settings > Accessories. |
+| `pureplay_match_window` | Pureplay | 8.0 | 1–30 | next shot | A replay is tagged with the Pureplay shot launched closest in time, if within this many seconds. |
+| `pureplay_units` | Pureplay | yards | yards / metres | next shot | Units of the distances on the shot card (feet on the green with yards). |
 | `update_check` | Updates | on | true / false | restart | The exe checks GitHub for a newer release when it starts (once a day at most). |
 
 ## Commands
@@ -252,6 +301,7 @@ python square_impact.py grab  [--shot]             every buffer in the ring (slo
 python square_impact.py sample [N] [--shot] [--range A:B]   every Nth buffer + contact sheet
 python square_impact.py impact [DIR]               find impact in a full-ring capture
 python square_impact.py settings                   open the settings page (saves square_impact.json)
+python square_impact.py pureplay                   pair with Pureplay and print its events (link check)
 python square_impact.py version                    version, update check, and the adb in use
 square_impact update [--force]                     replace the executable with the latest release
 
@@ -274,6 +324,8 @@ common options:
                           (default 0.2 = last 12 frames). With both defaults a clip
                           is 37 frames: contact ±18 frames (±36 ms)
   --pad N                 frames kept before and after contact (default 30)
+  --pureplay              obs/live/shot: Pureplay mode (see Pureplay mode)
+  --pureplay-host HOST    the PC running Pureplay (default 127.0.0.1)
   --no-update-check       skip the check for a newer release (exe only)
 ```
 

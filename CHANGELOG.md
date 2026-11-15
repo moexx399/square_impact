@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 Entries are managed with [changie](https://changie.dev): add one with
 `changie new` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## v0.17.0 - 2026-11-15
+### Added
+* Pureplay mode (--pureplay or the settings page): follows the Pureplay round over its Accessory API and tags each replay with the player, hole, shot and club, then the result once the ball is at rest, on the OBS overlay, in the viewers and in meta.json. square_impact pureplay checks the link
+
 ## v0.16.1 - 2026-11-01
 ### Fixed
 * Replays no longer show a faint ball-shaped ghost on the turf where the ball rested

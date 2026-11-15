@@ -45,6 +45,8 @@ Usage:
     python square_impact.py impact [DIR] [--pad N]  # find impact in a full-ring capture
     python square_impact.py view [DIR]            # view a capture (default: newest)
     python square_impact.py settings              # settings page (saves square_impact.json)
+    python square_impact.py pureplay              # pair with Pureplay and print its events;
+                                                  # obs/live/shot --pureplay tag replays with its shots
     python square_impact.py version               # version and the adb in use
     square_impact update [--force]                # replace the executable with the latest GitHub release
 
@@ -686,10 +688,13 @@ def r1_segment(lay, cap, pad):
 
 # ---------------------------------------------------------------- shot folders
 
-def save_shot(segments, info=""):
-    """Write one shot (one or more board segments, in play order) to shots/."""
+def save_shot(segments, info="", pureplay=None):
+    """Write one shot (one or more board segments, in play order) to shots/.
+    `pureplay`: the matching Pureplay shot (see PureplayClient), kept in
+    meta.json and named in the folder (e.g. ..._shot_r1+r2_H7S2_Joe)."""
     boards = [s["board"] for s in segments]
-    out_dir = os.path.join(SHOTS_DIR, time.strftime("%Y%m%d_%H%M%S") + "_shot_" + "+".join(boards))
+    out_dir = os.path.join(SHOTS_DIR, time.strftime("%Y%m%d_%H%M%S") + "_shot_" + "+".join(boards)
+                           + pureplay_tag(pureplay))
     base, k = out_dir, 1
     while os.path.exists(out_dir):
         k += 1
@@ -701,8 +706,11 @@ def save_shot(segments, info=""):
             for b, f in zip(s["idxs"], s["frames"][cam]):
                 write_pgm(os.path.join(out_dir, f"{s['board']}_cam{cam}_{b:03d}.pgm"), s["w"], s["h"], f)
         metas.append({k: v for k, v in s.items() if k != "frames"})
+    meta = {"shot": True, "boards": boards, "segments": metas, "sqocam": info}
+    if pureplay:
+        meta["pureplay"] = pureplay
     with open(os.path.join(out_dir, "meta.json"), "w") as fh:
-        json.dump({"shot": True, "boards": boards, "segments": metas, "sqocam": info}, fh)
+        json.dump(meta, fh)
     prune_captures()
     return out_dir
 
@@ -1669,7 +1677,9 @@ class Viewer:
         self.state = {"i": 0, "play": False}
         self.label = tk.Label(self.root, bg="#111")
         self.label.grid(row=0, column=0, padx=6, pady=6)
-        self.info = tk.Label(self.root, fg="#ddd", bg="#111", font=("Consolas", 10), anchor="w")
+        self.info = tk.Label(self.root, fg="#ddd", bg="#111", font=("Consolas", 10), anchor="w",
+                             justify="left")
+        self.pp_text = ""   # the Pureplay shot this is, when it was matched to one
         self.info.grid(row=1, column=0, sticky="we", padx=6)
         self.scale = tk.Scale(self.root, from_=0, to=1, orient="horizontal", length=1000,
                               showvalue=False, command=lambda v: self.show(int(v)), bg="#111",
@@ -1714,7 +1724,14 @@ class Viewer:
         self.dir, self.imgs = shot_dir, {}
         self.scale.configure(to=max(0, len(self.play) - 1))
         self.root.title(f"Omni frames - {os.path.basename(shot_dir)}")
+        self.set_pureplay(shot_meta(shot_dir).get("pureplay"), redraw=False)
         self.goto_impact()
+
+    def set_pureplay(self, rec, redraw=True):
+        card = pureplay_card(rec)
+        self.pp_text = " · ".join(x for x in (card["title"], card["result"]) if x) if card else ""
+        if redraw and self.play:
+            self.show(self.state["i"])
 
     def image(self, si, fi):
         if (si, fi) not in self.imgs:
@@ -1735,7 +1752,8 @@ class Viewer:
                 + ("  <<< IMPACT" if fi == s["impact"] and s["board"] == "r1" else "")
                 if s["offset_ms"] else f"buffer {s['idxs'][fi]}")
         self.info.configure(text=f"{s['board']} ({BOARD_NAMES.get(s['board'], '')})  "
-                                 f"frame {fi + 1}/{len(s['frames'])}   {when}")
+                                 f"frame {fi + 1}/{len(s['frames'])}   {when}"
+                                 + (f"\nPureplay: {self.pp_text}" if self.pp_text else ""))
         if self.scale.get() != self.state["i"]:
             self.scale.set(self.state["i"])
 
@@ -1852,7 +1870,7 @@ def board_loop(lay, cams, pad, out_q, stop):
             watcher.close()
 
 
-def shot_manager(cams, pad, emit, stop, once=False):
+def shot_manager(cams, pad, emit, stop, once=False, pureplay=None):
     """Capture from whichever camera boards are plugged in. Runs a board_loop
     per connected board (r1 launch, r2 spin), re-checking every few seconds as
     cables come and go, and pairs their captures of the same shot into one
@@ -1860,7 +1878,8 @@ def shot_manager(cams, pad, emit, stop, once=False):
 
     Reports through emit(kind, ...): ("status", text) and
     ("shot", out_dir, summary, t_shot, sqocam_text). With once=True, returns
-    the folder of the first shot."""
+    the folder of the first shot. With a PureplayClient, each shot is matched
+    to the Pureplay shot launched at the same time and saved with it."""
     q = queue.Queue()
     workers, state, serials = {}, {}, {}
     pending, first_at, last_scan = [], None, 0.0
@@ -1877,9 +1896,16 @@ def shot_manager(cams, pad, emit, stop, once=False):
     def finish():
         segs = [p[1] for p in sorted(pending, key=lambda p: p[0])]   # r1 before r2
         info = next((s.get("sqocam") for s in segs if s.get("sqocam")), "")
-        out_dir = save_shot(segs, info)
+        t_shot = min(p[4] for p in pending)
+        pp = pureplay.match(t_shot, sqocam_ball_speed(info)) if pureplay else None
+        out_dir = save_shot(segs, info, pp)
+        if pp:
+            pureplay.bind(pp["shotId"], out_dir, pp)
         summary = "  |  ".join(p[2] + "".join("; " + n for n in p[3]) for p in pending)
-        emit("shot", out_dir, summary, min(p[4] for p in pending), info)
+        if pureplay:
+            card = pureplay_card(pp)
+            summary += f"  |  Pureplay: {card['title']}" if card else "  |  Pureplay: no matching shot"
+        emit("shot", out_dir, summary, t_shot, info)
 
         def extras():   # not on the critical path: the clip is already showing
             write_impact_snapshot(out_dir)
@@ -1933,7 +1959,7 @@ def shot_manager(cams, pad, emit, stop, once=False):
     return None
 
 
-def shot_once(cams, pad):
+def shot_once(cams, pad, pureplay=None):
     stop = threading.Event()
 
     def emit(kind, *a):
@@ -1944,38 +1970,49 @@ def shot_once(cams, pad):
         else:
             print(f"{a[1]}\nsaved {a[0]}", flush=True)
     try:
-        return shot_manager(cams, pad, emit, stop, once=True)
+        return shot_manager(cams, pad, emit, stop, once=True, pureplay=pureplay)
     finally:
         stop.set()
 
 
-def live(cams, pad):
+def live(cams, pad, pureplay=None):
     """Viewer that re-arms after every shot and shows each one as it lands."""
     v = Viewer("Omni live")
     q = queue.Queue()
     stop = threading.Event()
-    shown = {"last": [], "state": ""}
+    shown = {"last": [], "state": "", "pp": ""}
 
     def emit(*msg):
         print(*msg[1:3], flush=True)
         q.put(msg)
 
+    if pureplay:   # a shot's result (or a mulligan) arrived: refresh it if it's on screen
+        pureplay.listeners.append(lambda shot_dir, rec: q.put(("pureplay", shot_dir, rec)))
+
     def pump():
+        changed = False
         try:
             while True:
                 msg = q.get_nowait()
+                changed = True
                 if msg[0] == "status":
                     shown["state"] = msg[1]
                 elif msg[0] == "snapshot":
                     pass
+                elif msg[0] == "pureplay":
+                    if msg[1] == v.dir:
+                        v.set_pureplay(msg[2])
                 else:
                     _, out_dir, summary, t_shot, info = msg
                     v.load(out_dir)
                     shown["last"] = [f"last shot: {summary}; on screen "
                                      f"{time.time() - t_shot:.1f}s after shot"] + ([info] if info else [])
-                v.set_status("\n".join(shown["last"] + [shown["state"]]))
         except queue.Empty:
             pass
+        if pureplay and pureplay.status != shown["pp"]:
+            shown["pp"], changed = pureplay.status, True
+        if changed:
+            v.set_status("\n".join(shown["last"] + [shown["state"]] + ([shown["pp"]] if shown["pp"] else [])))
         v.root.after(50, pump)
 
     def close():
@@ -1985,7 +2022,8 @@ def live(cams, pad):
     v.root.protocol("WM_DELETE_WINDOW", close)
     if DISPLAY_DENOISE or DISPLAY_ENHANCE:
         warm_up_pool()
-    threading.Thread(target=shot_manager, args=(cams, pad, emit, stop), daemon=True).start()
+    threading.Thread(target=shot_manager, args=(cams, pad, emit, stop),
+                     kwargs={"pureplay": pureplay}, daemon=True).start()
     if os.path.isdir(SHOTS_DIR) and glob.glob(os.path.join(SHOTS_DIR, "*", "meta.json")):
         try:
             v.load(latest_capture())
@@ -1993,6 +2031,680 @@ def live(cams, pad):
             pass
     pump()
     v.root.mainloop()
+
+
+# ---------------------------------------------------------------- Pureplay
+
+# Pureplay (a golf simulator) publishes the round it's playing over its
+# Accessory API, a WebSocket on port 9770 (docs/protocol.md in
+# https://github.com/PureplayGolf/Pureplay-Accessory). In Pureplay mode
+# square_impact follows the round and tags each replay with Pureplay's player,
+# hole, shot number and club, then the shot's result once the ball is at rest.
+# It only reads: it never sends Pureplay a command, whatever it was granted.
+PUREPLAY = False                 # set from settings: pureplay
+PUREPLAY_HOST = "127.0.0.1"      # set from settings: pureplay_host (IPv4: Pureplay doesn't listen on ::1)
+PUREPLAY_PORT = 9770             # set from settings: pureplay_port
+PUREPLAY_MATCH_WINDOW = 8.0      # set from settings: pureplay_match_window
+PUREPLAY_UNITS = "yards"         # set from settings: pureplay_units
+PUREPLAY_TOKEN = os.path.join(data_dir(), "pureplay.json")   # the pairing token, kept off the settings page
+PUREPLAY_LAUNCH_WAIT = 2.0       # s to wait for Pureplay's launch when a capture is ready before it
+PUREPLAY_BACKOFF = (1, 2, 4, 8, 16, 30)   # s between reconnects, as the API asks
+PUREPLAY_KEEPALIVE = 20          # s of silence before asking for a snapshot (proves the link is alive)
+PUREPLAY_DEAD = 60               # s of silence after which the connection is treated as dropped
+PUREPLAY_KEEP_SHOTS = 50         # Pureplay shots remembered for matching
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_MAX_FRAME = 16 << 20
+
+
+class WSClosed(Exception):
+    """The WebSocket closed: code is the close frame's code, 1006 for a drop."""
+
+    def __init__(self, code=None, reason=""):
+        super().__init__(f"closed {code}" + (f": {reason}" if reason else ""))
+        self.code, self.reason = code, reason
+
+
+class PureplayStop(Exception):
+    """Pureplay refused us in a way retrying won't fix; the text says what to do."""
+
+
+def ws_mask(data, key):
+    """data XOR the 4-byte key, repeated (RFC 6455 masking; also unmasks)."""
+    if not data:
+        return b""
+    rep = (key * (len(data) // 4 + 1))[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(rep, "big")).to_bytes(len(data), "big")
+
+
+def ws_frame(opcode, payload, mask=True):
+    """One complete WebSocket frame. Clients must mask what they send; servers don't."""
+    n = len(payload)
+    bit = 0x80 if mask else 0
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([bit | n])
+    elif n < 65536:
+        head += bytes([bit | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([bit | 127]) + struct.pack(">Q", n)
+    if not mask:
+        return head + payload
+    key = os.urandom(4)
+    return head + key + ws_mask(payload, key)
+
+
+def ws_parse(buf):
+    """(fin, opcode, payload, bytes used) for the first whole frame in buf, or
+    None if it hasn't all arrived yet."""
+    if len(buf) < 2:
+        return None
+    fin, opcode = bool(buf[0] & 0x80), buf[0] & 0x0F
+    masked, n, pos = buf[1] & 0x80, buf[1] & 0x7F, 2
+    if n == 126:
+        if len(buf) < 4:
+            return None
+        n, pos = struct.unpack(">H", bytes(buf[2:4]))[0], 4
+    elif n == 127:
+        if len(buf) < 10:
+            return None
+        n, pos = struct.unpack(">Q", bytes(buf[2:10]))[0], 10
+    if n > WS_MAX_FRAME:
+        raise WSClosed(1009, "frame too big")
+    key = b""
+    if masked:
+        if len(buf) < pos + 4:
+            return None
+        key, pos = bytes(buf[pos:pos + 4]), pos + 4
+    if len(buf) < pos + n:
+        return None
+    payload = bytes(buf[pos:pos + n])
+    return fin, opcode, ws_mask(payload, key) if masked else payload, pos + n
+
+
+class WebSocket:
+    """Minimal WebSocket client (RFC 6455), standard library only: no TLS,
+    no extensions. Enough for Pureplay's ws:// API on the same PC or LAN."""
+
+    def __init__(self, host, port, path="/", protocol="binary", timeout=5):
+        import base64
+        import hashlib
+        import socket
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                               f"Sec-WebSocket-Protocol: {protocol}\r\n\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise WSClosed(1006, "closed during the handshake")
+                buf += chunk
+                if len(buf) > 65536:
+                    raise OSError("bad WebSocket handshake")
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            if not re.match(r"HTTP/1\.[01] 101\b", lines[0]):
+                raise OSError(f"not a WebSocket server ({lines[0]})")
+            hdr = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+            want = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+            if hdr.get("sec-websocket-accept") != want:
+                raise OSError("bad WebSocket handshake (Sec-WebSocket-Accept)")
+        except BaseException:
+            self.sock.close()
+            raise
+        self.buf = bytearray(rest)
+        self.parts, self.heard = [], time.time()
+        self.send_lock = threading.Lock()
+
+    def _send(self, opcode, payload):
+        with self.send_lock:
+            self.sock.sendall(ws_frame(opcode, payload))
+
+    def send(self, text):
+        self._send(0x1, text.encode("utf-8"))
+
+    def recv(self, timeout=None):
+        """The next message's bytes (text or binary). TimeoutError if none
+        arrives in time (nothing is lost: partial frames stay buffered),
+        WSClosed when the connection closes. Answers pings by itself."""
+        self.sock.settimeout(timeout)
+        while True:
+            f = ws_parse(self.buf)
+            if f is None:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise WSClosed(1006, "connection dropped")
+                self.buf += chunk
+                continue
+            fin, op, payload, used = f
+            del self.buf[:used]
+            self.heard = time.time()
+            if op == 0x8:   # close: echo the code back, then report it
+                code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else 1005
+                try:
+                    self._send(0x8, payload[:2])
+                except OSError:
+                    pass
+                raise WSClosed(code, payload[2:].decode("utf-8", "replace"))
+            if op == 0x9:
+                self._send(0xA, payload)
+                continue
+            if op == 0xA:
+                continue
+            self.parts.append(payload)   # 1 text, 2 binary, 0 continuation
+            if fin:
+                data, self.parts = b"".join(self.parts), []
+                return data
+
+    def close(self, code=1000):
+        try:
+            self._send(0x8, struct.pack(">H", code))
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+CLUB_TYPE = re.compile(r"(Wood|Hybrid|Iron)(\d)")
+OUTCOME_TEXT = {"InPlay": "In play", "OB": "Out of bounds", "PenaltyOnly": "Penalty",
+                "AutoPutt": "Auto putt", "Holed": "Holed"}
+
+
+def club_label(club, name=None):
+    """A club as a player reads it: the bag's own name, else "7 Iron" from Iron7."""
+    if name:
+        return name
+    if not club:
+        return ""
+    m = CLUB_TYPE.fullmatch(club)
+    if m:
+        return f"{m[2]} {m[1]}"
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", club)   # PitchingWedge -> Pitching Wedge
+
+
+def pp_distance(m, units=None):
+    """Metres as yards (feet when short) or metres, per the pureplay_units setting."""
+    if m is None:
+        return ""
+    if (units or PUREPLAY_UNITS) == "metres":
+        return f"{m:.1f} m" if m < 10 else f"{m:.0f} m"
+    yd = m * 1.0936133
+    return f"{m * 3.2808399:.0f} ft" if yd < 20 else f"{yd:.0f} yd"
+
+
+def pureplay_card(pp, units=None):
+    """{"title", "result"} lines for a Pureplay shot record (see PureplayClient):
+    who hit it and with what, then where it finished ("" until it's at rest)."""
+    if not pp:
+        return None
+    title = " · ".join(x for x in (
+        pp.get("player"),
+        f"Hole {pp['hole']}" if pp.get("hole") else "",
+        f"Shot {pp['stroke']}" if pp.get("stroke") else "",
+        club_label(pp.get("club"), pp.get("clubName"))) if x)
+    r = pp.get("result") or {}
+    parts = []
+    if r:
+        outcome = r.get("outcome") or ""
+        label = (r.get("lie") or "In play") if outcome == "InPlay" else OUTCOME_TEXT.get(outcome, outcome)
+        parts.append(label)
+        if not r.get("isPutt") and r.get("carryM"):
+            parts.append("carry " + pp_distance(r["carryM"], units))
+        if r.get("totalM"):
+            parts.append(("rolled " if r.get("isPutt") else "total ") + pp_distance(r["totalM"], units))
+        if outcome == "Holed" and r.get("holeStrokes"):
+            parts.append(f"in {r['holeStrokes']}")
+        elif r.get("endDistToHoleM") is not None and outcome not in ("OB", "Water", "Lost"):
+            parts.append(pp_distance(r["endDistToHoleM"], units) + " to the pin")
+        if r.get("penaltyStrokes"):
+            parts.append(f"+{r['penaltyStrokes']} penalty")
+    if pp.get("replacedBy"):
+        parts.append("(mulligan)" if pp.get("replacedReason") == "mulligan" else "(replayed)")
+    elif pp.get("cancelled") == "discarded":
+        parts.append("(not used)")
+    return {"title": title, "result": " · ".join(parts)}
+
+
+def pureplay_tag(pp):
+    """Shot folder suffix from a Pureplay record, e.g. _H7S2_Joe."""
+    if not pp:
+        return ""
+    tag = f"_H{pp['hole']}S{pp['stroke']}" if pp.get("hole") and pp.get("stroke") else ""
+    name = re.sub(r"[^A-Za-z0-9-]+", "", pp.get("player") or "")[:20]
+    return tag + (f"_{name}" if name else "")
+
+
+def shot_meta(shot_dir):
+    """A shot folder's meta.json, {} if it can't be read."""
+    try:
+        with open(os.path.join(shot_dir, "meta.json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def update_shot_meta(shot_dir, pureplay):
+    """Store a shot's latest Pureplay record in its meta.json (it may have been pruned: fine)."""
+    meta = shot_meta(shot_dir)
+    if not meta:
+        return False
+    meta["pureplay"] = pureplay
+    tmp = os.path.join(shot_dir, "meta.json.tmp")
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(meta, fh)
+        os.replace(tmp, os.path.join(shot_dir, "meta.json"))
+        return True
+    except OSError:
+        return False
+
+
+def sqocam_ball_speed(info):
+    """The Omni's ball speed (m/s) from sqocam_text, or None."""
+    m = re.search(r"ball speed (-?[\d.]+) m/s", info or "")
+    return float(m[1]) if m else None
+
+
+class PureplayClient:
+    """Follows a Pureplay round over its Accessory API, in a background thread.
+
+    Pairs once (the player approves square_impact in the game; the token is
+    saved to PUREPLAY_TOKEN so later runs connect silently), subscribes to
+    every event, and keeps a record of each recent shot:
+        {shotId, playerId, player, hole, stroke, club, clubName,
+         launch: {ballSpeedMs, launchAngleDeg, directionDeg, backSpinRpm, sideSpinRpm},
+         launchedAt (this PC's clock), result: {outcome, carryM, totalM, ...},
+         replacedBy / replacedReason (mulligan, re-hit), cancelled}
+    match() pairs a capture with the shot Pureplay launched closest in time;
+    bind() then keeps that shot folder's meta.json up to date, and each change
+    to a bound shot (its result, a mulligan) is passed to the listeners as
+    listener(shot_dir, record). Reconnects with backoff for as long as it runs."""
+
+    def __init__(self, host=None, port=None, token_path=None, log=print, on_event=None,
+                 backoff=PUREPLAY_BACKOFF):
+        self.host, self.port = host or PUREPLAY_HOST, port or PUREPLAY_PORT
+        self.token_path = token_path or PUREPLAY_TOKEN
+        self.log, self.on_event, self.backoff = log, on_event, backoff
+        self.cond = threading.Condition()
+        self.shots = collections.OrderedDict()
+        self.listeners = []
+        self.state = None              # latest snapshot
+        self.status = ""
+        self.connected = False         # paired and subscribed
+        self.scopes = []
+        self.server_id = None
+        self.stop_ev = threading.Event()
+        self.ws, self.thread = None, None
+        self.attempt, self.retry_after, self.seq = 0, None, 0
+
+    # ---- lifecycle
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return self
+
+    def close(self):
+        self.stop_ev.set()
+        ws = self.ws
+        if ws:
+            ws.close()
+        if self.thread:
+            self.thread.join(timeout=3)
+
+    def set_status(self, text):
+        if text != self.status:
+            self.status = text
+            self.log(text)
+
+    def load_token(self):
+        try:
+            with open(self.token_path, encoding="utf-8") as fh:
+                tok = json.load(fh).get("token")
+            return tok if isinstance(tok, str) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def save_token(self, token, client_id):
+        try:
+            os.makedirs(os.path.dirname(self.token_path) or ".", exist_ok=True)
+            tmp = self.token_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"token": token, "clientId": client_id}, fh)
+            os.replace(tmp, self.token_path)
+        except OSError as e:
+            self.log(f"Pureplay: couldn't save the pairing token to {self.token_path} ({e}); "
+                     f"the game will ask to approve square_impact again next time")
+
+    def forget_token(self):
+        try:
+            os.remove(self.token_path)
+        except OSError:
+            pass
+
+    def _run(self):
+        where = f"{self.host}:{self.port}"
+        while not self.stop_ev.is_set():
+            wait = None
+            try:
+                self.ws = WebSocket(self.host, self.port)
+                self._session(self.ws)
+            except PureplayStop as e:
+                self.set_status(f"Pureplay: {e}")
+                break
+            except WSClosed as e:
+                wait = self._closed(e)
+                if wait is False:
+                    break
+            except (ConnectionRefusedError, TimeoutError):
+                self.set_status(f"Pureplay: not reachable at {where}. Is it running, with Settings > "
+                                f"Accessories > Allow apps from set to This PC (or Your network)?")
+            except (OSError, ValueError) as e:
+                if not self.stop_ev.is_set():
+                    self.set_status(f"Pureplay: connection to {where} failed ({e}); retrying")
+            finally:
+                self.connected = False
+                if self.ws:
+                    self.ws.close()
+                    self.ws = None
+                with self.cond:
+                    self.cond.notify_all()   # anyone waiting in match() stops waiting
+            if self.stop_ev.is_set():
+                break
+            delay = wait or self.backoff[min(self.attempt, len(self.backoff) - 1)]
+            self.attempt += 1
+            self.stop_ev.wait(delay)
+
+    def _closed(self, e):
+        """What a close code means for us: seconds to wait before retrying,
+        None for the usual backoff, False to give up."""
+        if self.stop_ev.is_set():
+            return False
+        retry = self.retry_after
+        self.retry_after = None
+        if e.code == 4401:
+            self.forget_token()
+            self.set_status("Pureplay: square_impact was removed in Pureplay (or its token is no longer "
+                            "valid); asking to pair again")
+            return None
+        if e.code == 4403:
+            self.set_status("Pureplay: refused. Approve square_impact when Pureplay asks, and keep "
+                            "Settings > Accessories > Ask about new apps on; then restart square_impact")
+            return False
+        if e.code == 4408:
+            self.set_status("Pureplay: the approval request timed out; asking again shortly")
+            return retry or 120
+        if e.code == 4429:
+            self.set_status("Pureplay: too many connection attempts; waiting before trying again")
+            return retry or 30
+        self.set_status("Pureplay: connection lost; reconnecting")
+        return None
+
+    # ---- one connection
+
+    def _send(self, ws, type_, data=None, id_=None, **extra):
+        msg = {"type": type_, **extra}
+        if id_:
+            msg["id"] = id_
+        if data is not None:
+            msg["data"] = data
+        ws.send(json.dumps(msg))
+
+    @staticmethod
+    def _read(ws, timeout):
+        raw = ws.recv(timeout)
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return {}
+        return msg if isinstance(msg, dict) else {}
+
+    def _session(self, ws):
+        hello = self._read(ws, 10)
+        if hello.get("type") != "hello":
+            raise OSError("no hello from the server: is that Pureplay?")
+        data = hello.get("data") or {}
+        if data.get("version") != 1:
+            raise PureplayStop(f"this Pureplay speaks Accessory API version {data.get('version')}; "
+                               f"square_impact {VERSION} supports version 1. Check for an update")
+        sid = data.get("serverInstanceId")
+        if sid != self.server_id:   # Pureplay restarted: nothing remembered applies any more
+            with self.cond:
+                self.shots.clear()
+                self.state = None
+            self.server_id = sid
+        self.seq = 0
+        self._send(ws, "pair", {"client": "square_impact", "version": VERSION, "token": self.load_token()},
+                   "pair")
+        asked = 0.0
+        while not self.stop_ev.is_set():
+            try:
+                msg = self._read(ws, 1)
+            except TimeoutError:
+                quiet = time.time() - ws.heard
+                if quiet > PUREPLAY_DEAD and self.connected:
+                    raise WSClosed(1006, "no answer") from None
+                if (quiet > PUREPLAY_KEEPALIVE and self.connected
+                        and time.time() - asked > PUREPLAY_KEEPALIVE):
+                    asked = time.time()
+                    self._send(ws, "state.get", id_="keepalive")
+                continue
+            self._message(ws, msg)
+
+    def _message(self, ws, msg):
+        kind, data = msg.get("type"), msg.get("data") or {}
+        if kind == "pairing.pending":
+            self.set_status("Pureplay: approve square_impact in the game (a prompt is showing in Pureplay)")
+        elif kind == "paired":
+            if data.get("token"):
+                self.save_token(data["token"], data.get("clientId"))
+            self.scopes = data.get("scopes") or []
+            self._send(ws, "subscribe", {"snapshot": True}, "sub")
+            self.connected, self.attempt = True, 0
+            self.set_status("Pureplay: connected; tagging replays with Pureplay's shots")
+        elif kind == "response" and not msg.get("ok", True):
+            err = msg.get("error") or {}
+            if err.get("retryAfterMs"):
+                self.retry_after = err["retryAfterMs"] / 1000
+            if msg.get("id") not in ("keepalive",):
+                self.log(f"Pureplay: {msg.get('id') or 'request'} refused: "
+                         f"{err.get('code')} {err.get('message', '')}".rstrip())
+        elif kind == "event":
+            seq = msg.get("seq")
+            if isinstance(seq, int):
+                if self.seq and seq != self.seq + 1:   # missed something: start again from the state
+                    self._send(ws, "state.get", id_="resync")
+                self.seq = seq
+            name = (msg.get("event") or "").lower()
+            self._event(ws, name, data)
+            if self.on_event:
+                self.on_event(name, data)
+
+    # ---- state
+
+    def _player(self, pid):
+        for p in (self.state or {}).get("players") or []:
+            if p.get("playerId") == pid:
+                return p
+        return {}
+
+    def _club_name(self, pid, club_id):
+        for c in self._player(pid).get("bag") or []:
+            if club_id and c.get("clubId") == club_id:
+                return c.get("name")
+        return None
+
+    def _record(self, shot_id):
+        rec = self.shots.get(shot_id)
+        if rec is None:
+            rec = self.shots[shot_id] = {"shotId": shot_id}
+            while len(self.shots) > PUREPLAY_KEEP_SHOTS:
+                self.shots.popitem(last=False)
+        return rec
+
+    def _fill(self, rec):
+        """Fill in who and what from the snapshot, where the shot's own events didn't say."""
+        st = self.state or {}
+        cur = st.get("shot") or {}
+        if cur.get("shotId") == rec["shotId"]:
+            rec.setdefault("playerId", cur.get("playerId"))
+            rec.setdefault("hole", cur.get("holeNumber"))
+            rec.setdefault("stroke", cur.get("strokeNumber"))
+        pid = rec.get("playerId")
+        p = self._player(pid)
+        if p.get("name") and not rec.get("player"):
+            rec["player"] = p["name"]
+        if not rec.get("club") and p.get("club"):
+            rec["club"], rec["clubId"] = p["club"], p.get("clubId")
+        if not rec.get("hole") and st.get("hole"):
+            rec["hole"] = st["hole"].get("number")
+        if rec.get("clubId") and not rec.get("clubName"):
+            rec["clubName"] = self._club_name(pid, rec["clubId"])
+
+    def _event(self, ws, name, d):
+        changed = None
+        with self.cond:
+            if name == "state.snapshot":
+                self.state = d
+                cur = d.get("shot") or {}
+                if cur.get("shotId"):
+                    self._fill(self._record(cur["shotId"]))
+            elif name == "shot.initialized" and d.get("shotId"):
+                rec = self._record(d["shotId"])
+                rec.update({"playerId": d.get("playerId"), "hole": d.get("holeNumber"),
+                            "stroke": d.get("strokeNumber"), "club": d.get("club"),
+                            "clubId": d.get("clubId"), "matchId": d.get("matchId")})
+                if d.get("replacesShotId"):
+                    rec["replaces"] = d["replacesShotId"]
+                self._fill(rec)
+            elif name == "shot.launched" and d.get("shotId"):
+                rec = self._record(d["shotId"])
+                rec.setdefault("playerId", d.get("playerId"))
+                rec["launch"] = {k: d.get(k) for k in ("ballSpeedMs", "launchAngleDeg", "directionDeg",
+                                                       "backSpinRpm", "sideSpinRpm")}
+                rec["launchedAt"] = time.time()
+                self._fill(rec)
+            elif name == "shot.completed" and d.get("shotId"):
+                rec = self._record(d["shotId"])
+                rec["result"] = {k: d.get(k) for k in (
+                    "outcome", "penaltyStrokes", "isPutt", "carryM", "totalM", "apexM",
+                    "startDistToHoleM", "endDistToHoleM", "lie", "holeStrokes")}
+                changed = rec
+            elif name == "shot.replayed" and d.get("replacesShotId"):
+                old = self.shots.get(d["replacesShotId"])
+                if old is not None:
+                    old["replacedBy"], old["replacedReason"] = d.get("shotId"), d.get("reason")
+                    changed = old
+            elif name == "shot.cancelled" and d.get("shotId") in self.shots:
+                rec = self.shots[d["shotId"]]
+                rec["cancelled"] = d.get("reason")
+                changed = rec
+            elif name == "player.club_changed" and d.get("shotId") in self.shots:
+                rec = self.shots[d["shotId"]]
+                if "launchedAt" not in rec:   # the club in hand when it's hit is what counts
+                    rec["club"], rec["clubId"] = d.get("current"), d.get("currentClubId")
+                    rec.pop("clubName", None)
+                    self._fill(rec)
+            self.cond.notify_all()
+            out = (changed.get("dir"), self.public(changed)) if changed and changed.get("dir") else None
+        if ((name.startswith("player.") and name != "player.club_changed")
+                or name in ("hole.started", "context.invalidated", "match.started")):
+            self._send(ws, "state.get", id_="refresh")   # names, bags, hole: take them from the state
+        if out:
+            self._changed(*out)
+
+    def _changed(self, shot_dir, rec):
+        update_shot_meta(shot_dir, rec)
+        for fn in list(self.listeners):
+            try:
+                fn(shot_dir, rec)
+            except Exception:  # noqa: BLE001 - a listener's bug mustn't stop following the round
+                traceback.print_exc()
+
+    @staticmethod
+    def public(rec):
+        """A record as stored in meta.json: a copy, without bookkeeping."""
+        return {k: (dict(v) if isinstance(v, dict) else v) for k, v in rec.items()
+                if k not in ("dir", "claimed")}
+
+    # ---- matching captures
+
+    def _best(self, t_shot, speed):
+        best, score = None, None
+        for rec in self.shots.values():
+            t = rec.get("launchedAt")
+            if t is None or rec.get("claimed") or abs(t - t_shot) > PUREPLAY_MATCH_WINDOW:
+                continue
+            s = abs(t - t_shot)
+            pp_speed = (rec.get("launch") or {}).get("ballSpeedMs")
+            if speed is not None and pp_speed is not None:
+                s += abs(speed - pp_speed) / 5   # a tie-breaker only: Pureplay's speed has the lie applied
+            if score is None or s < score:
+                best, score = rec, s
+        return best
+
+    def match(self, t_shot, speed=None, wait=None):
+        """The Pureplay shot launched closest to t_shot (this PC's clock, when the
+        Omni logged the shot) within PUREPLAY_MATCH_WINDOW, claimed so no other
+        capture gets it; None if there's none. Waits up to `wait` seconds for
+        Pureplay's launch when the capture was ready first."""
+        deadline = time.time() + (PUREPLAY_LAUNCH_WAIT if wait is None else wait)
+        with self.cond:
+            while True:
+                best = self._best(t_shot, speed)
+                left = deadline - time.time()
+                if best or left <= 0 or not self.connected:
+                    break
+                self.cond.wait(timeout=left)
+            if not best:
+                return None
+            best["claimed"] = True
+            self._fill(best)
+            return self.public(best)
+
+    def bind(self, shot_id, shot_dir, saved):
+        """The shot was saved to shot_dir with record `saved`: keep its meta.json
+        current from now on, and catch up on anything that changed meanwhile."""
+        with self.cond:
+            rec = self.shots.get(shot_id)
+            if rec is None:
+                return
+            rec["dir"] = shot_dir
+            now = self.public(rec)
+        if now != saved:
+            self._changed(shot_dir, now)
+
+
+def start_pureplay():
+    """Pureplay mode: follow the round in the background (obs, live, shot)."""
+    print(paint("2", f"  Pureplay mode: following the round at ws://{PUREPLAY_HOST}:{PUREPLAY_PORT}/"),
+          flush=True)
+    return PureplayClient(log=lambda t: print(t, flush=True)).start()
+
+
+def pureplay_monitor():
+    """`square_impact pureplay`: pair with Pureplay and print its events as they
+    happen, to check the link before a session."""
+    def on_event(name, data):
+        text = json.dumps(data, separators=(",", ":"))
+        print(f"{time.strftime('%H:%M:%S')}  {name}  {text[:300] + '…' if len(text) > 300 else text}",
+              flush=True)
+
+    print(f"Connecting to Pureplay at ws://{PUREPLAY_HOST}:{PUREPLAY_PORT}/ (pairing token: "
+          f"{PUREPLAY_TOKEN})\nCtrl+C to stop.", flush=True)
+    client = PureplayClient(log=lambda t: print(t, flush=True), on_event=on_event).start()
+    try:
+        while client.thread.is_alive():
+            client.thread.join(timeout=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------- OBS overlay
@@ -2008,19 +2720,41 @@ OVERLAY_PAGE = r"""<!doctype html>
   canvas { display: block; width: 100vw; height: auto; }
   #info { font: 600 2.2vw system-ui, sans-serif; color: #fff; text-shadow: 0 1px 4px #000;
           padding: .4em .6em; position: absolute; left: 0; bottom: 0; }
+  #pp { font: 700 2.4vw system-ui, sans-serif; color: #fff; text-shadow: 0 1px 4px #000;
+        padding: .4em .6em; position: absolute; left: 0; top: 0; }
+  #pp:empty, #res:empty { display: none; }
+  #res { position: fixed; right: .6em; top: .5em; font: 700 2.4vw system-ui, sans-serif; color: #fff;
+         background: rgba(0, 0, 0, .55); border-radius: .4em; padding: .3em .7em; opacity: 0;
+         transition: opacity var(--fade); }
+  #res.on { opacity: 1; }
 </style></head>
-<body><div id="wrap"><canvas id="c"></canvas><div id="info"></div></div>
+<body><div id="wrap"><canvas id="c"></canvas><div id="pp"></div><div id="info"></div></div>
+<div id="res"></div>
 <script>
 // Options (defaults from the settings page / square_impact.json; a URL parameter
 // overrides): fps (launch-camera playback speed), fps2 (spin-camera close-up),
 // hold (ms to freeze on the impact frame; 0 = no freeze), loops, gap (ms between
-// loops), fade (ms), gain (brightness multiplier), info=1 (show sqocam's numbers)
+// loops), fade (ms), gain (brightness multiplier), info=1 (show sqocam's numbers),
+// pp_card=1 (Pureplay mode: who, hole, shot, club), pp_result (ms to show the
+// shot's result once Pureplay has it; 0 = never)
 const P = new URLSearchParams(location.search);
 const CFG = __CONFIG__;
 const opt = k => P.has(k) ? P.get(k) : String(CFG[k]);
 const FPS = +opt('fps') || 30, FPS2 = +opt('fps2') || 10, LOOPS = +opt('loops') || 2,
       GAP = +opt('gap') || 0, FADE = +opt('fade') || 0, GAIN = +opt('gain') || 1,
-      INFO = ['1', 'true'].includes(opt('info')), HOLD = +opt('hold') || 0;
+      INFO = ['1', 'true'].includes(opt('info')), HOLD = +opt('hold') || 0,
+      PP = ['1', 'true'].includes(opt('pp_card')), RESULT_MS = +opt('pp_result') || 0;
+const ppEl = document.getElementById('pp'), resEl = document.getElementById('res');
+let shownName = null, resTimer = null, resShown = '';
+function card(name, c) {          // the Pureplay card of shot `name` (null: not matched)
+  if (name !== shownName) return;   // only the shot that's playing, or played last
+  ppEl.textContent = PP && c ? c.title : '';
+  if (!PP || !RESULT_MS || !c || !c.result || c.result === resShown) return;
+  resShown = resEl.textContent = c.result;
+  resEl.classList.add('on');
+  clearTimeout(resTimer);
+  resTimer = setTimeout(() => resEl.classList.remove('on'), RESULT_MS);
+}
 const QUIET_MS = 15000;   // no event or ping for this long (pings come every 5 s): reconnect
 document.documentElement.style.setProperty('--fade', FADE + 'ms');
 const wrap = document.getElementById('wrap'), cv = document.getElementById('c'),
@@ -2063,6 +2797,8 @@ async function show(s) {
   };
   draw(tl[0]);
   infoEl.textContent = INFO ? (s.info || '') : '';
+  shownName = s.name; resShown = ''; resEl.classList.remove('on');
+  card(s.name, s.pureplay);
   wrap.classList.add('on');
   // Timer-driven from wall-clock time (not requestAnimationFrame, which stalls
   // when the page isn't being painted), so the hide always happens on schedule.
@@ -2092,6 +2828,11 @@ function connect() {
   es.onopen = () => { heard = performance.now(); };
   es.addEventListener('ping', () => { heard = performance.now(); });
   es.addEventListener('config', () => location.reload());   // settings saved: pick them up
+  es.addEventListener('pureplay', e => {                    // the shot's result arrived from Pureplay
+    heard = performance.now();
+    const d = JSON.parse(e.data);
+    card(d.name, d.pureplay);
+  });
   es.onmessage = e => { heard = performance.now(); show(JSON.parse(e.data)); };
 }
 connect();
@@ -2163,9 +2904,10 @@ SETTINGS_PAGE = r"""<!doctype html>
   .reset { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0 2px;
            font: inherit; font-size: 12px; text-decoration: underline; }
   .ctl { align-self: center; justify-self: end; width: 100%; }
-  input[type=number], select { width: 100%; padding: 8px 10px; border-radius: 9px; font: inherit;
-         border: 1px solid var(--line); background: var(--field); color: var(--text); }
-  input[type=number]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input[type=number], input[type=text], select { width: 100%; padding: 8px 10px; border-radius: 9px;
+         font: inherit; border: 1px solid var(--line); background: var(--field); color: var(--text); }
+  input[type=number]:focus, input[type=text]:focus, select:focus { outline: 2px solid var(--accent);
+         outline-offset: 1px; }
   .switch { justify-self: end; }
   .switch input { width: 46px; height: 26px; appearance: none; border-radius: 999px; cursor: pointer;
                   background: var(--line); position: relative; transition: background .15s; margin: 0; }
@@ -2236,6 +2978,11 @@ function control(s) {
     for (const c of s.choices) sel.append(el('option', { value: c, textContent: c, selected: c === v }));
     sel.onchange = () => edit(s, sel.value);
     return el('span', { className: 'ctl' }, sel);
+  }
+  if (s.kind === 'text') {
+    const i = el('input', { type: 'text', id: 'f_' + s.key, value: v, spellcheck: false });
+    i.oninput = () => { if (i.value.trim() !== '') edit(s, i.value.trim()); };
+    return el('span', { className: 'ctl' }, i);
   }
   const i = el('input', { type: 'number', id: 'f_' + s.key, value: v,
                           step: s.step ?? (s.kind === 'int' ? 1 : 'any') });
@@ -2446,7 +3193,7 @@ document.getElementById('save').onclick = async () => {
     for (const k of Object.keys(edits)) delete edits[k];
     state = body;
     render();
-    refreshBar(restart ? 'Saved. Restart square_impact for the port or update setting to take effect.'
+    refreshBar(restart ? 'Saved. Restart square_impact for the changes marked "applies after a restart".'
                        : 'Saved', 'ok');
   } catch (e) {
     refreshBar('Not saved: square_impact isn\'t reachable', 'bad');
@@ -2469,6 +3216,19 @@ class Overlay:
         self.shots = {}       # seq -> (header dict, frame bytes); last few kept
         self.current = None
         self.config_seq = 0   # bumps when settings are saved; open pages reload
+        self.pp_seq = 0       # bumps when a shot's Pureplay card changes (its result arrived)
+        self.pp_msg = None
+
+    def pureplay_update(self, name, card):
+        """Shot folder `name` has a new Pureplay card: tell open pages, and keep
+        it with the stored shot so /replay shows it too."""
+        with self.cond:
+            for seq, (header, data) in list(self.shots.items()):
+                if header.get("name") == name:
+                    self.shots[seq] = ({**header, "pureplay": card}, data)
+            self.pp_seq += 1
+            self.pp_msg = {"name": name, "pureplay": card}
+            self.cond.notify_all()
 
     def config_changed(self):
         with self.cond:
@@ -2506,7 +3266,8 @@ def overlay_payload(out_dir, info=""):
     segs = display_segments(out_dir)
     header = {"segments": [{"board": s["board"], "w": s["w"], "h": s["h"], "n": len(s["frames"]),
                             "impact": s["impact"]} for s in segs],
-              "info": info, "name": os.path.basename(out_dir)}
+              "info": info, "name": os.path.basename(out_dir),
+              "pureplay": pureplay_card(shot_meta(out_dir).get("pureplay"))}
     return header, b"".join(b"".join(s["frames"]) for s in segs)
 
 
@@ -2613,20 +3374,23 @@ def serve_overlay(ov, port):
                 self.end_headers()
                 with ov.cond:
                     seen = ov.seq  # don't replay the last shot when OBS (re)loads the page
-                    cseen = ov.config_seq
+                    cseen, pseen = ov.config_seq, ov.pp_seq
                 try:
                     self.wfile.write(b"retry: 2000\n\n")   # browser's reconnect delay after a drop
                     self.wfile.flush()
                     while True:
                         with ov.cond:
-                            ov.cond.wait_for(lambda s=seen, c=cseen: ov.seq != s or ov.config_seq != c,
-                                             timeout=OVERLAY_PING)
+                            ov.cond.wait_for(lambda s=seen, c=cseen, p=pseen: (
+                                ov.seq != s or ov.config_seq != c or ov.pp_seq != p), timeout=OVERLAY_PING)
                             fresh, reconfigured = ov.seq != seen, ov.config_seq != cseen
-                            seen, cseen = ov.seq, ov.config_seq
+                            pp = ov.pp_msg if ov.pp_seq != pseen else None
+                            seen, cseen, pseen = ov.seq, ov.config_seq, ov.pp_seq
                             header = ov.shots[seen][0] if fresh else None
                         # named events, not SSE comments: the page's watchdog has to see them
                         msg = (f"data: {json.dumps(header)}\n\n" if fresh else
-                               "event: config\ndata: \n\n" if reconfigured else "event: ping\ndata: \n\n")
+                               "event: config\ndata: \n\n" if reconfigured else
+                               f"event: pureplay\ndata: {json.dumps(pp)}\n\n" if pp else
+                               "event: ping\ndata: \n\n")
                         self.wfile.write(msg.encode())
                         self.wfile.flush()
                 except OSError:
@@ -2651,9 +3415,12 @@ def serve_overlay(ov, port):
     return srv
 
 
-def obs(cams, pad, port):
+def obs(cams, pad, port, pureplay=None):
     """Headless capture from the connected boards, feeding an OBS browser-source overlay."""
     ov = Overlay()
+    if pureplay:   # a shot's result (or a mulligan) arrived: update its card on the overlay
+        pureplay.listeners.append(
+            lambda shot_dir, rec: ov.pureplay_update(os.path.basename(shot_dir), pureplay_card(rec)))
     try:
         serve_overlay(ov, port)
     except OSError:
@@ -2689,7 +3456,7 @@ def obs(cams, pad, port):
                 print(info, flush=True)
 
     try:
-        shot_manager(cams, pad, emit, stop)
+        shot_manager(cams, pad, emit, stop, pureplay=pureplay)
     except KeyboardInterrupt:
         pass
     finally:
@@ -2795,6 +3562,31 @@ SETTINGS = [
              "Multiplies every pixel's brightness in the overlay.", min=0.2, max=4, step=0.1),
     _setting("info", "OBS overlay", "bool", False, "Show the Omni's numbers",
              "Overlay ball speed, launch, direction and spin from the Omni's own log."),
+    _setting("pp_card", "OBS overlay", "bool", True, "Show the Pureplay shot card",
+             "In Pureplay mode: show who hit the shot, the hole, shot number and club over the replay."),
+    _setting("pp_result", "OBS overlay", "int", 6000, "Show Pureplay's result (ms)",
+             "In Pureplay mode: how long the shot's result (where it finished, carry, total) shows "
+             "once the ball is at rest, even if the replay has already hidden. 0 to never show it.",
+             min=0, max=30000),
+
+    _setting("pureplay", "Pureplay", "bool", False, "Pureplay mode",
+             "Follow the round in Pureplay and tag each replay with its player, hole, shot number "
+             "and club, then the result. In Pureplay, set Settings > Accessories > Allow apps from to "
+             "This PC and approve square_impact when asked (once). Read-only: never changes the game.",
+             "PUREPLAY", "restart"),
+    _setting("pureplay_host", "Pureplay", "text", "127.0.0.1", "Pureplay address",
+             "The PC running Pureplay: 127.0.0.1 for this PC, or that PC's IP address (Pureplay then "
+             "needs Allow apps from: Your network).", "PUREPLAY_HOST", "restart"),
+    _setting("pureplay_port", "Pureplay", "int", 9770, "Pureplay port",
+             "Port shown in Pureplay's Settings > Accessories.", "PUREPLAY_PORT", "restart",
+             min=1, max=65535),
+    _setting("pureplay_match_window", "Pureplay", "float", 8.0, "Shot matching window (s)",
+             "A replay is tagged with the Pureplay shot launched closest in time to the Omni logging "
+             "it, if within this many seconds. Untagged replays still show.",
+             "PUREPLAY_MATCH_WINDOW", "next shot", min=1, max=30, step=0.5),
+    _setting("pureplay_units", "Pureplay", "choice", "yards", "Distances in",
+             "Units of the distances on the shot card (feet on the green with yards).",
+             "PUREPLAY_UNITS", "next shot", choices=["yards", "metres"]),
 
     _setting("update_check", "Updates", "bool", True, "Check for updates",
              "The exe checks GitHub for a newer release when it starts (once a day at most).",
@@ -2818,6 +3610,11 @@ def coerce_setting(key, value):
         if value in s["choices"]:
             return value
         raise ValueError("must be one of " + ", ".join(s["choices"]))
+    if kind == "text":
+        if isinstance(value, str) and value.strip() and len(value.strip()) <= 253 \
+                and not re.search(r"\s", value.strip()):
+            return value.strip()
+        raise ValueError("must be a host name or IP address")
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValueError("must be a number")
     try:
@@ -3004,11 +3801,11 @@ def page_config():
 
 # ---------------------------------------------------------------- main
 
-VERSION = "0.16.1"
+VERSION = "0.17.0"
 MODE_TEXT = {
     "obs": "OBS overlay", "live": "live viewer", "shot": "single shot", "view": "viewer",
     "status": "status", "sample": "sample", "grab": "full grab", "impact": "impact finder",
-    "settings": "settings",
+    "settings": "settings", "pureplay": "Pureplay link check",
 }
 
 
@@ -3302,7 +4099,7 @@ def main():
     multiprocessing.freeze_support()   # denoise worker processes inside the packaged exe
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["obs", "live", "shot", "status", "sample", "grab", "view",
-                                    "impact", "settings", "version", "update"])
+                                    "impact", "settings", "version", "update", "pureplay"])
     ap.add_argument("arg", nargs="?", help="sample: step N; view/impact: capture dir")
     ap.add_argument("--shot", action="store_true", help="sample/grab: wait for the next shot")
     ap.add_argument("--range", metavar="A:B", help="sample: only buffers A..B-1 (e.g. 120:150)")
@@ -3335,6 +4132,11 @@ def main():
     ap.add_argument("--board", choices=list(BOARD_MODE),
                     help="grab/sample: which board when both are connected (default r1)")
     ap.add_argument("--no-view", action="store_true", help="don't open the viewer afterwards")
+    ap.add_argument("--pureplay", action="store_true",
+                    help="obs/live/shot: Pureplay mode, tag replays with the Pureplay round's "
+                         "player, hole, shot and club (see settings)")
+    ap.add_argument("--pureplay-host", metavar="HOST",
+                    help="address of the PC running Pureplay (default 127.0.0.1)")
     ap.add_argument("--no-update-check", action="store_true",
                     help="don't check GitHub for a newer release (exe only; also "
                          "SQUARE_IMPACT_NO_UPDATE_CHECK=1)")
@@ -3361,7 +4163,9 @@ def main():
 def cli_overrides(a):
     """The settings given on the command line (they win over the config file)."""
     cli = {"pad": a.pad, "port": a.port, "trim_front": a.trim_front, "trim_back": a.trim_back,
-           "crop": a.crop}
+           "crop": a.crop, "pureplay_host": a.pureplay_host}
+    if a.pureplay:
+        cli["pureplay"] = True
     if a.cam and a.cmd in ("obs", "live", "shot"):   # grab/sample take --cam for themselves
         cli["cam"] = {"0": "top", "1": "bottom"}.get(a.cam, a.cam)
     if a.denoise or a.no_denoise:
@@ -3377,6 +4181,8 @@ def run(a):
     global ADB, SERIAL
     if a.cmd == "settings":
         return settings_command()
+    if a.cmd == "pureplay":
+        return pureplay_monitor()
     if a.cmd != "obs":   # obs's overlay server serves the settings page too
         start_settings_server()
     if a.cmd == "view":
@@ -3387,11 +4193,16 @@ def run(a):
     ADB = find_adb()
     stop_children_at_exit()
     if a.cmd in ("obs", "live", "shot"):   # camera and padding come from the settings, per shot
-        if a.cmd == "obs":
-            return obs(None, None, OVERLAY_PORT)
-        if a.cmd == "live":
-            return live(None, None)
-        d = shot_once(None, None)
+        pp = start_pureplay() if PUREPLAY else None
+        try:
+            if a.cmd == "obs":
+                return obs(None, None, OVERLAY_PORT, pp)
+            if a.cmd == "live":
+                return live(None, None, pp)
+            d = shot_once(None, None, pp)
+        finally:
+            if pp:
+                pp.close()
         return None if a.no_view else view(d)
     if a.cmd == "status":
         return status()

@@ -932,7 +932,7 @@ class ShotManager(unittest.TestCase):
             q.put(("segment", b, {"board": b}, f"{b} ok", [], 100.0))
             stop_ev.wait()
 
-        def fake_save(segs, info):
+        def fake_save(segs, info, pureplay=None):
             saved.append([s["board"] for s in segs])
             return "dir"
 
@@ -1132,6 +1132,398 @@ class Logo(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+# ---------------------------------------------------------------- Pureplay
+
+class FakePureplay:
+    """A stand-in for Pureplay's Accessory API on a free local port: the n-th
+    connection runs scripts[n](conn). Records every message clients send."""
+
+    def __init__(self, *scripts):
+        import socket
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(4)
+        self.port = self.srv.getsockname()[1]
+        self.scripts, self.received, self.errors = list(scripts), [], []
+        self.done = threading.Event()   # the last script waits for this
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        for script in self.scripts:
+            try:
+                sock, _ = self.srv.accept()
+            except OSError:
+                return
+            try:
+                script(FakeConn(sock, self))
+            except Exception as e:  # noqa: BLE001 - reported by the test
+                self.errors.append(e)
+            finally:
+                sock.close()
+
+    def close(self):
+        self.done.set()
+        self.srv.close()
+
+
+class FakeConn:
+    def __init__(self, sock, server):
+        import base64
+        import hashlib
+        self.sock, self.server, self.seq, self.buf = sock, server, 0, bytearray()
+        sock.settimeout(5)
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += sock.recv(4096)
+        head, _, rest = req.partition(b"\r\n\r\n")
+        self.buf += rest
+        hdr = dict(ln.split(": ", 1) for ln in head.decode().split("\r\n")[1:])
+        assert hdr["Sec-WebSocket-Protocol"] == "binary", hdr
+        accept = base64.b64encode(hashlib.sha1((hdr["Sec-WebSocket-Key"] + si.WS_GUID).encode()).digest())
+        sock.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Protocol: binary\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+
+    def send(self, obj):   # Pureplay only ever sends binary frames
+        self.sock.sendall(si.ws_frame(2, json.dumps(obj).encode(), mask=False))
+
+    def event(self, name, data):
+        self.seq += 1
+        self.send({"type": "event", "event": name, "seq": self.seq, "time": "2026-11-15T12:00:00Z",
+                   "data": data})
+
+    def hello(self, sid="s-1"):
+        self.send({"type": "hello", "data": {"protocol": "ppaccessory", "version": 1, "game": "Pureplay",
+                                              "paired": False, "connectionId": "c-1",
+                                              "serverInstanceId": sid, "capabilities": {}}})
+
+    def recv(self):
+        while True:
+            f = si.ws_parse(self.buf)
+            if f is None:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("client went away")
+                self.buf += chunk
+                continue
+            fin, op, payload, used = f
+            del self.buf[:used]
+            if op in (1, 2):
+                msg = json.loads(payload)
+                self.server.received.append(msg)
+                return msg
+
+    def close(self, code):
+        self.sock.sendall(si.ws_frame(8, struct.pack(">H", code), mask=False))
+
+    def pair_ok(self, token="PPA-1"):
+        msg = self.recv()
+        assert msg["type"] == "pair", msg
+        self.send({"type": "paired", "data": {"token": token, "clientId": "C-1", "scopes": ["read"]}})
+        sub = self.recv()
+        assert sub["type"] == "subscribe" and sub["data"]["snapshot"] is True, sub
+        self.send({"type": "response", "id": sub.get("id"), "ok": True, "data": {}})
+        return msg
+
+
+SNAPSHOT = {"session": {"apiVersion": 1, "matchActive": True}, "hole": {"number": 7, "par": 4},
+            "players": [{"playerId": 1, "name": "Joe", "club": "Iron7", "clubId": "c7",
+                         "bag": [{"clubId": "c7", "type": "Iron7", "name": "Joe's 7"}]}],
+            "shot": None, "readiness": {}, "lie": None, "ruling": None}
+
+
+def wait_for(cond, timeout=5):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class WebSocketFrames(unittest.TestCase):
+    def test_round_trip_every_length_encoding(self):
+        for n in (0, 5, 125, 126, 1000, 65535, 70000):
+            payload = bytes(i % 251 for i in range(n))
+            for mask in (True, False):
+                frame = si.ws_frame(2, payload, mask)
+                self.assertEqual(si.ws_parse(frame), (True, 2, payload, len(frame)), (n, mask))
+                self.assertIsNone(si.ws_parse(frame[:-1]))   # not all there yet
+
+    def test_client_frames_are_masked(self):
+        frame = si.ws_frame(1, b"hello")
+        self.assertTrue(frame[1] & 0x80)
+        self.assertNotIn(b"hello", frame)
+
+
+class PureplayFormatting(unittest.TestCase):
+    REC = {"shotId": "s1", "player": "Joe Bloggs!", "hole": 7, "stroke": 2, "club": "Iron7",
+           "result": {"outcome": "Green", "carryM": 138.4, "totalM": 145.1, "endDistToHoleM": 2.0,
+                      "isPutt": False, "penaltyStrokes": 0}}
+
+    def test_card(self):
+        card = si.pureplay_card(self.REC, "yards")
+        self.assertEqual(card["title"], "Joe Bloggs! · Hole 7 · Shot 2 · 7 Iron")
+        self.assertEqual(card["result"], "Green · carry 151 yd · total 159 yd · 7 ft to the pin")
+        self.assertIn("carry 138 m", si.pureplay_card(self.REC, "metres")["result"])
+        self.assertIsNone(si.pureplay_card(None))
+
+    def test_card_holed_and_mulligan(self):
+        rec = {**self.REC, "result": {"outcome": "Holed", "isPutt": True, "totalM": 3.0, "holeStrokes": 3,
+                                      "endDistToHoleM": 0.0}}
+        self.assertEqual(si.pureplay_card(rec, "yards")["result"], "Holed · rolled 10 ft · in 3")
+        rec = {**self.REC, "result": None, "replacedBy": "s2", "replacedReason": "mulligan"}
+        self.assertEqual(si.pureplay_card(rec)["result"], "(mulligan)")
+
+    def test_club_labels(self):
+        self.assertEqual(si.club_label("Wood3"), "3 Wood")
+        self.assertEqual(si.club_label("PitchingWedge"), "Pitching Wedge")
+        self.assertEqual(si.club_label("Iron7", "My 7"), "My 7")
+
+    def test_folder_tag_is_filename_safe(self):
+        self.assertEqual(si.pureplay_tag(self.REC), "_H7S2_JoeBloggs")
+        self.assertEqual(si.pureplay_tag(None), "")
+
+    def test_ball_speed_from_sqocam_text(self):
+        self.assertEqual(si.sqocam_ball_speed("sqocam: ball speed 61.2 m/s, launch 18 deg"), 61.2)
+        self.assertIsNone(si.sqocam_ball_speed(""))
+
+
+class PureplayMatching(unittest.TestCase):
+    def client(self, *shots):
+        c = si.PureplayClient(token_path=os.devnull, log=lambda t: None)
+        for s in shots:
+            c.shots[s["shotId"]] = s
+        return c
+
+    def test_closest_launch_within_the_window(self):
+        c = self.client({"shotId": "a", "launchedAt": 100.0}, {"shotId": "b", "launchedAt": 104.0},
+                        {"shotId": "far", "launchedAt": 200.0})
+        self.assertEqual(c.match(103.0, wait=0)["shotId"], "b")
+        self.assertEqual(c.match(103.0, wait=0)["shotId"], "a")   # b is taken now
+        self.assertIsNone(c.match(103.0, wait=0))
+        self.assertIsNone(c.match(150.0, wait=0))
+
+    def test_ball_speed_breaks_ties(self):
+        c = self.client({"shotId": "a", "launchedAt": 100.0, "launch": {"ballSpeedMs": 30.0}},
+                        {"shotId": "b", "launchedAt": 101.0, "launch": {"ballSpeedMs": 60.0}})
+        self.assertEqual(c.match(100.5, speed=59.0, wait=0)["shotId"], "b")
+
+    def test_matched_record_has_no_bookkeeping(self):
+        c = self.client({"shotId": "a", "launchedAt": 100.0})
+        self.assertNotIn("claimed", c.match(100.0, wait=0))
+
+
+class PureplayClientSession(unittest.TestCase):
+    """Against a fake Pureplay: pairing, token handling, close codes, events."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.token = os.path.join(self.tmp, "pureplay.json")
+        self.logs, self.client, self.server = [], None, None
+
+    def tearDown(self):
+        if self.client:
+            self.client.close()
+        if self.server:
+            self.server.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def start(self, *scripts):
+        self.server = FakePureplay(*scripts)
+        self.client = si.PureplayClient("127.0.0.1", self.server.port, self.token, log=self.logs.append,
+                                        backoff=(0.05,)).start()
+        return self.server
+
+    def test_pairs_follows_a_shot_and_updates_the_saved_shot(self):
+        go = threading.Event()
+
+        def script(c):
+            c.hello()
+            c.send({"type": "pairing.pending", "data": {"expiresInSec": 60}})
+            c.pair_ok("PPA-NEW")
+            c.event("state.snapshot", SNAPSHOT)
+            c.event("shot.initialized", {"shotId": "s1", "playerId": 1, "holeNumber": 7, "strokeNumber": 2,
+                                         "club": "Iron7", "clubId": "c7"})
+            c.event("shot.launched", {"shotId": "s1", "playerId": 1, "ballSpeedMs": 61.2})
+            go.wait(5)
+            c.event("shot.completed", {"shotId": "s1", "outcome": "Green", "carryM": 138.4, "totalM": 145.1,
+                                       "endDistToHoleM": 7.4, "isPutt": False})
+            self.server.done.wait(5)
+
+        self.start(script)
+        self.assertTrue(wait_for(lambda: self.client.connected), self.logs)
+        rec = self.client.match(time.time(), 61.0, wait=5)
+        self.assertIsNotNone(rec, self.logs)
+        self.assertEqual((rec["player"], rec["hole"], rec["stroke"], rec["clubName"]),
+                         ("Joe", 7, 2, "Joe's 7"))
+        self.assertEqual(rec["launch"]["ballSpeedMs"], 61.2)
+        with open(self.token) as fh:
+            self.assertEqual(json.load(fh)["token"], "PPA-NEW")
+        self.assertTrue(any("approve" in t for t in self.logs))
+        self.assertIsNone(self.server.received[0]["data"]["token"])
+
+        shot_dir = os.path.join(self.tmp, "shot")
+        os.makedirs(shot_dir)
+        with open(os.path.join(shot_dir, "meta.json"), "w") as fh:
+            json.dump({"shot": True, "pureplay": rec}, fh)
+        heard = []
+        self.client.listeners.append(lambda d, r: heard.append((d, r)))
+        self.client.bind("s1", shot_dir, rec)
+        go.set()
+        self.assertTrue(wait_for(lambda: heard), self.logs)
+        self.assertEqual(heard[0][0], shot_dir)
+        self.assertEqual(si.shot_meta(shot_dir)["pureplay"]["result"]["outcome"], "Green")
+        self.assertEqual(self.server.errors, [])
+
+    def test_reconnects_with_the_saved_token(self):
+        with open(self.token, "w") as fh:
+            json.dump({"token": "PPA-SAVED"}, fh)
+
+        def drop(c):
+            c.hello()
+            c.pair_ok("PPA-SAVED")   # then the socket closes without a close frame (1006)
+
+        def stay(c):
+            c.hello()
+            c.pair_ok("PPA-SAVED")
+            self.server.done.wait(5)
+
+        server = self.start(drop, stay)
+        self.assertTrue(wait_for(lambda: len([m for m in server.received if m["type"] == "pair"]) == 2))
+        self.assertTrue(wait_for(lambda: self.client.connected))
+        self.assertEqual([m["data"]["token"] for m in server.received if m["type"] == "pair"],
+                         ["PPA-SAVED", "PPA-SAVED"])
+        self.assertEqual(server.errors, [])
+
+    def test_removed_app_forgets_its_token_and_pairs_again(self):
+        with open(self.token, "w") as fh:
+            json.dump({"token": "PPA-OLD"}, fh)
+
+        def removed(c):
+            c.hello()
+            msg = c.recv()
+            c.send({"type": "response", "id": msg.get("id"), "ok": False,
+                    "error": {"code": "unauthorised", "message": "Unknown token."}})
+            c.close(4401)
+            time.sleep(0.2)
+
+        def again(c):
+            c.hello()
+            c.pair_ok("PPA-NEW")
+            self.server.done.wait(5)
+
+        server = self.start(removed, again)
+        self.assertTrue(wait_for(lambda: len([m for m in server.received if m["type"] == "pair"]) == 2))
+        self.assertTrue(wait_for(lambda: self.client.connected))
+        self.assertEqual([m["data"]["token"] for m in server.received if m["type"] == "pair"],
+                         ["PPA-OLD", None])
+        self.assertTrue(wait_for(lambda: self.client.load_token() == "PPA-NEW"))
+
+    def test_denied_stops_retrying(self):
+        def denied(c):
+            c.hello()
+            c.recv()
+            c.close(4403)
+            time.sleep(0.2)
+
+        self.start(denied, denied)
+        self.assertTrue(wait_for(lambda: not self.client.thread.is_alive()))
+        self.assertIn("refused", self.client.status)
+        self.assertEqual(len([m for m in self.server.received if m["type"] == "pair"]), 1)
+
+    def test_unsupported_version_stops(self):
+        def v2(c):
+            c.send({"type": "hello", "data": {"version": 2, "serverInstanceId": "s"}})
+            time.sleep(0.5)
+
+        self.start(v2)
+        self.assertTrue(wait_for(lambda: not self.client.thread.is_alive()))
+        self.assertIn("version 2", self.client.status)
+
+
+class PureplayShots(unittest.TestCase):
+    REC = {"shotId": "s1", "player": "Joe", "hole": 7, "stroke": 2, "club": "Iron7"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._shots = si.SHOTS_DIR
+        si.SHOTS_DIR = self.tmp
+
+    def tearDown(self):
+        si.SHOTS_DIR = self._shots
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_saved_with_the_pureplay_shot(self):
+        seg = {"board": "r1", "cams": [1], "w": 2, "h": 1, "idxs": [0], "impact": 0,
+               "frames": {1: [b"\0\0"]}}
+        d = si.save_shot([seg], "", self.REC)
+        self.assertTrue(os.path.basename(d).endswith("_shot_r1_H7S2_Joe"))
+        self.assertEqual(si.shot_meta(d)["pureplay"], self.REC)
+        self.assertIn(os.path.basename(d), si.saved_shots())
+        self.assertTrue(si.update_shot_meta(d, {**self.REC, "result": {"outcome": "Green"}}))
+        self.assertEqual(si.shot_meta(d)["pureplay"]["result"], {"outcome": "Green"})
+        self.assertFalse(si.update_shot_meta(os.path.join(self.tmp, "pruned"), self.REC))
+
+    def test_shot_manager_matches_and_binds(self):
+        from unittest import mock
+        saved, bound, emitted = [], [], []
+
+        class FakeClient:
+            def match(self, t_shot, speed=None):
+                return dict(PureplayShots.REC)
+
+            def bind(self, shot_id, d, rec):
+                bound.append((shot_id, d))
+
+        def fake_loop(lay, cams, pad, q, stop_ev):
+            q.put(("segment", lay["board"], {"board": lay["board"]}, "ok", [], 100.0))
+            stop_ev.wait()
+
+        def fake_save(segs, info, pureplay=None):
+            saved.append(pureplay)
+            return "dir"
+
+        stop = threading.Event()
+        with mock.patch.object(si, "connected_boards", return_value={"r1": "r1"}), \
+                mock.patch.object(si, "device_layout", side_effect=lambda s: {"board": s, "serial": s}), \
+                mock.patch.object(si, "board_loop", fake_loop), \
+                mock.patch.object(si, "save_shot", fake_save), \
+                mock.patch.object(si, "write_impact_snapshot"), \
+                mock.patch.object(si, "write_sheets"):
+            si.shot_manager([1], 30, lambda *m: emitted.append(m), stop, once=True, pureplay=FakeClient())
+        stop.set()
+        self.assertEqual(saved, [self.REC])
+        self.assertEqual(bound, [("s1", "dir")])
+        shot = [m for m in emitted if m[0] == "shot"][0]
+        self.assertIn("Pureplay: Joe · Hole 7 · Shot 2 · 7 Iron", shot[2])
+
+    def test_overlay_pushes_the_result(self):
+        import urllib.request
+        ov = si.Overlay()
+        ov.publish({"name": "x", "segments": []}, b"")
+        srv = si.serve_overlay(ov, 0)
+        try:
+            r = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/events", timeout=5)
+            r.readline()   # "retry: 2000"
+            r.readline()
+            threading.Timer(0.2, ov.pureplay_update, ("x", {"title": "Joe", "result": "Green"})).start()
+            lines = [r.readline() for _ in range(2)]
+            self.assertEqual(lines[0], b"event: pureplay\n")
+            self.assertEqual(json.loads(lines[1][6:]),
+                             {"name": "x", "pureplay": {"title": "Joe", "result": "Green"}})
+            self.assertEqual(ov.shots[ov.current][0]["pureplay"]["result"], "Green")   # /replay has it
+            r.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_host_setting(self):
+        self.assertEqual(si.coerce_setting("pureplay_host", " 192.168.1.20 "), "192.168.1.20")
+        for bad in ("", "a b", 5):
+            with self.assertRaises(ValueError):
+                si.coerce_setting("pureplay_host", bad)
 
 
 if __name__ == "__main__":
